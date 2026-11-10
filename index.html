@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Desk">
+  <meta name="theme-color" content="#000000">
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <title>Grok Bot</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="app">
+    <div id="banner" class="error-banner" hidden></div>
+    <div id="view" class="view"></div>
+    <nav id="tabbar" class="tabbar" aria-label="Main">
+      <button class="tab" data-tab="home" type="button">
+        <span class="tab-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1v-9.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </span>
+        <span>Home</span>
+      </button>
+      <button class="tab" data-tab="agents" type="button">
+        <span class="tab-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg>
+        </span>
+        <span>Agents</span>
+      </button>
+      <button class="tab" data-tab="activity" type="button">
+        <span class="tab-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 6h14M5 12h14M5 18h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </span>
+        <span>Activity</span>
+      </button>
+      <button class="tab" data-tab="account" type="button">
+        <span class="tab-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="3.2" stroke="currentColor" stroke-width="1.7"/><path d="M5 19.2c1.3-2.8 3.4-4.2 7-4.2s5.7 1.4 7 4.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </span>
+        <span>Account</span>
+      </button>
+    </nav>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
