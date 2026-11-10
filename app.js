@@ -1,43 +1,41 @@
-import { drawLineChart, drawCandles, drawScoreRing } from "./chart.js";
+import { drawBalanceLine, drawCandles, drawRing } from "./chart.js";
 import { applyAuthParams, parseAuthParams } from "./auth.js";
+
+/* Trading Desk — PAPER. Read-only view of encrypted snapshots. Stop / Pause / Resume go
+   through the desk's own Telegram bot (owner-only commands); this page never places orders. */
 
 const LS_TOKEN = "desk.appToken";
 const LS_PATH = "desk.dataPath";
-const LS_SEEN = "desk.activitySeen";
+const LS_STARS = "desk.stars";
 const POLL_MS = 15000;
 const INFO = "desk-plan-b-v1";
 const AGENT_ORDER = ["scanner", "auditor", "analyst", "executor", "risk"];
 const RANGES = ["LIVE", "1H", "4H", "1D", "1W", "ALL"];
+const RANGE_MS = { "1H": 3600e3, "4H": 4 * 3600e3, "1D": 24 * 3600e3, "1W": 7 * 24 * 3600e3 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $("#view");
 const banner = $("#banner");
-const tabbar = $("#tabbar");
+const sheetRoot = $("#sheet-root");
 
-const reduced = () =>
-  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const reduced = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function baseUrl() { return new URL("./", location.href); }
 
-function baseUrl() {
-  return new URL("./", location.href);
-}
-
-/* ---------- auth fragment ---------- */
+/* ---------- auth fragment (unchanged flow) ---------- */
 
 function consumeAuthFragment() {
-  // Fragment only. Never read ?t= / ?d= — query strings hit server logs.
   const td = parseAuthParams(location.hash || "");
   if (!td) return;
   applyAuthParams(td);
   const raw = (location.hash || "").replace(/^#/, "");
-  let route = "";
+  let r = "";
   const ampRoute = raw.search(/&\/|^\//);
   if (ampRoute >= 0) {
     const rest = raw.slice(ampRoute).replace(/^&/, "");
-    route = rest.startsWith("/") ? "#" + rest : (rest ? "#" + rest : "");
+    r = rest.startsWith("/") ? "#" + rest : (rest ? "#" + rest : "");
   }
-  history.replaceState(null, "", location.pathname + route);
+  history.replaceState(null, "", location.pathname + r);
 }
-
 function unlockFromPaste(raw) {
   const td = parseAuthParams(raw);
   if (!td) return false;
@@ -46,7 +44,6 @@ function unlockFromPaste(raw) {
   Object.assign(route, parseRoute());
   return true;
 }
-
 function token() { return localStorage.getItem(LS_TOKEN) || ""; }
 function dataPath() { return localStorage.getItem(LS_PATH) || ""; }
 
@@ -58,94 +55,108 @@ function b64ToU8(s) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
-
 async function deriveKey(appToken, salt, info) {
-  const ikm = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(appToken),
-    "HKDF",
-    false,
-    ["deriveKey"]
-  );
-  return crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt, info },
-    ikm,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["decrypt"]
-  );
+  const ikm = await crypto.subtle.importKey("raw", new TextEncoder().encode(appToken), "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info }, ikm, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
 }
-
 async function decryptEnvelope(env, appToken) {
   if (!env || env.v !== 1) throw new Error("unsupported envelope");
-  const salt = b64ToU8(env.salt);
-  const iv = b64ToU8(env.iv);
-  const ct = b64ToU8(env.ct);
-  const info = new TextEncoder().encode(env.info || INFO);
-  const key = await deriveKey(appToken, salt, info);
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+  const key = await deriveKey(appToken, b64ToU8(env.salt), new TextEncoder().encode(env.info || INFO));
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToU8(env.iv) }, key, b64ToU8(env.ct));
   return JSON.parse(new TextDecoder().decode(pt));
 }
-
 function dataHref(rel) {
   return new URL("d/" + encodeURIComponent(dataPath()) + "/" + rel.replace(/^\//, ""), baseUrl()).href;
 }
-
 async function loadJson(rel) {
-  const res = await fetch(dataHref(rel), { cache: "no-store" });
-  if (!res.ok) {
-    const err = new Error("http " + res.status);
-    err.status = res.status;
-    throw err;
-  }
-  const env = await res.json();
-  return decryptEnvelope(env, token());
+  const res = await fetch(dataHref(rel) + "?_=" + Math.floor(Date.now() / 10000), { cache: "no-store" });
+  if (!res.ok) { const err = new Error("http " + res.status); err.status = res.status; throw err; }
+  return decryptEnvelope(await res.json(), token());
 }
 
-/* ---------- store ---------- */
+/* ---------- public market data (no secrets; coin addresses only) ---------- */
+
+const meta = {}; // mint -> {image, mc, created, price, pool, symbol, name, fetched}
+async function fetchMeta(mints) {
+  const want = [...new Set(mints.filter(Boolean))].filter((m) => !meta[m] || Date.now() - meta[m].fetched > 60e3);
+  for (let i = 0; i < want.length; i += 30) {
+    const chunk = want.slice(i, i + 30);
+    try {
+      const res = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + chunk.join(","), { referrerPolicy: "no-referrer" });
+      if (!res.ok) continue;
+      const pairs = await res.json();
+      const now = Date.now();
+      chunk.forEach((m) => { if (!meta[m]) meta[m] = { fetched: now }; else meta[m].fetched = now; });
+      for (const p of pairs || []) {
+        const m = p.baseToken && p.baseToken.address;
+        if (!m || !chunk.includes(m)) continue;
+        const cur = meta[m];
+        if (cur.pairAddress && cur.dexId === "pumpswap") continue; // keep the pumpswap pair, as the desk does
+        const img = p.info && p.info.imageUrl;
+        Object.assign(cur, {
+          image: typeof img === "string" && img.startsWith("https://") ? img : cur.image,
+          mc: Number(p.marketCap || p.fdv) || cur.mc,
+          created: p.pairCreatedAt || cur.created,
+          price: Number(p.priceUsd) || cur.price,
+          pairAddress: p.pairAddress,
+          dexId: p.dexId,
+          symbol: p.baseToken.symbol,
+          name: p.baseToken.name,
+        });
+      }
+    } catch { /* offline: fall back to desk data */ }
+  }
+}
+
+const ohlcv = {}; // pool -> {candles, fetched}
+async function fetchOhlcv(pool, ageMin) {
+  if (!pool) return null;
+  const hit = ohlcv[pool];
+  if (hit && Date.now() - hit.fetched < 60e3) return hit.candles;
+  let tf = "minute", agg = 5;
+  if (ageMin != null && ageMin > 36 * 60) { tf = "hour"; agg = 1; }
+  else if (ageMin != null && ageMin > 6 * 60) { agg = 15; }
+  try {
+    const res = await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${encodeURIComponent(pool)}/ohlcv/${tf}?aggregate=${agg}&limit=80`, { referrerPolicy: "no-referrer" });
+    if (!res.ok) throw new Error("ohlcv " + res.status);
+    const js = await res.json();
+    const list = (((js || {}).data || {}).attributes || {}).ohlcv_list || [];
+    const candles = list.map((r) => ({ t: r[0] * 1000, o: r[1], h: r[2], l: r[3], c: r[4] })).sort((a, b) => a.t - b.t);
+    ohlcv[pool] = { candles, fetched: Date.now() };
+    return candles;
+  } catch {
+    ohlcv[pool] = { candles: null, fetched: Date.now() };
+    return null;
+  }
+}
+
+/* ---------- store / routes ---------- */
 
 const store = {
-  state: null,
-  chart: {},
-  activity: null,
-  account: null,
-  settings: null,
-  decisions: {},
-  coins: {},
-  audits: {},
-  updatedAt: null,
-  error: null,
-  retryIn: 0,
-  loading: true,
-  range: "LIVE",
-  demo: null, // 'empty' | 'error' for screenshots
+  state: null, chart: {}, activity: null, account: null, settings: null, decisions: {},
+  coins: {}, updatedAt: null, error: null, retryIn: 0, loading: true, range: "LIVE",
+  pending: null, // {action, at}
+  demo: null,
 };
-
-const route = {
-  tab: "home",
-  screen: "home", // home|agents|activity|account|coin|audit|lock
-  mint: null,
-};
+const route = { screen: "home", mint: null, name: null };
 
 function parseRoute() {
-  const h = (location.hash || "").replace(/^#/, "");
-  if (!h || h === "/" || h === "home") return { tab: "home", screen: "home", mint: null };
-  const parts = h.replace(/^\//, "").split("/");
+  const h = (location.hash || "").replace(/^#\/?/, "");
+  const parts = h.split("/");
   const a = parts[0];
-  if (a === "agents") return { tab: "agents", screen: "agents", mint: null };
-  if (a === "activity") return { tab: "activity", screen: "activity", mint: null };
-  if (a === "account") return { tab: "account", screen: "account", mint: null };
-  if (a === "coin" && parts[1]) return { tab: route.tab === "account" ? "home" : route.tab, screen: "coin", mint: parts[1] };
-  if (a === "audit" && parts[1]) return { tab: route.tab === "account" ? "home" : route.tab, screen: "audit", mint: parts[1] };
-  return { tab: "home", screen: "home", mint: null };
+  if (a === "activity") return { screen: "activity" };
+  if (a === "account") return { screen: "account" };
+  if (a === "agents") return { screen: "agent", name: parts[1] || "scanner" };
+  if ((a === "coin" || a === "audit") && parts[1]) return { screen: "coin", mint: parts[1] };
+  return { screen: "home" };
 }
-
 function go(hash, opts = {}) {
-  const url = (hash.startsWith("#") ? hash : "#" + hash);
-  if (opts.replace) history.replaceState(null, "", url);
-  else history.pushState(null, "", url);
-  Object.assign(route, parseRoute());
+  const url = hash.startsWith("#") ? hash : "#" + hash;
+  if (opts.replace) history.replaceState(null, "", url); else history.pushState(null, "", url);
+  Object.assign(route, { mint: null, name: null }, parseRoute());
   render();
+  window.scrollTo(0, 0);
+  view.scrollTop = 0;
 }
 
 /* ---------- formatters ---------- */
@@ -153,413 +164,258 @@ function go(hash, opts = {}) {
 function money(n, digits = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   const v = Number(n);
-  const abs = Math.abs(v);
-  if (abs >= 1000 && digits === 2) {
-    return (v < 0 ? "-" : "") + "$" + abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-  return (v < 0 ? "-" : "") + "$" + abs.toFixed(digits);
+  return (v < 0 ? "-" : "") + "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function signedMoney(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  return (v < 0 ? "-" : "+") + "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function compactMoney(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   const v = Number(n), a = Math.abs(v), s = v < 0 ? "-" : "";
+  if (a >= 1e9) return s + "$" + (a / 1e9).toFixed(2) + "B";
   if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(a >= 1e7 ? 1 : 2) + "M";
-  if (a >= 1e3) return s + "$" + (a / 1e3).toFixed(a >= 1e4 ? 1 : 1) + "K";
-  return s + "$" + a.toFixed(2);
+  if (a >= 1e3) return s + "$" + (a / 1e3).toFixed(1) + "K";
+  return s + "$" + a.toFixed(a >= 100 ? 0 : 2);
 }
-function pct(n, signed = true) {
+function pct(n, digits = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
-  const v = Number(n);
-  const sign = signed && v >= 0 ? "+" : "";
-  return sign + v.toFixed(2) + "%";
+  return Number(n).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits }) + "%";
 }
-function agoAge(min) {
-  if (min == null) return "";
-  const m = Number(min);
-  if (m < 60) return m + "m old";
-  if (m < 60 * 24) return Math.round(m / 60) + "h old";
-  return Math.round(m / (60 * 24)) + "d old";
+function tsMs(ts) {
+  if (!ts) return NaN;
+  const s = String(ts);
+  return new Date(/Z$|[+-]\d\d:?\d\d$/.test(s) ? s : s + "Z").getTime();
 }
 function fmtTime(ts) {
-  if (!ts) return "";
-  const d = new Date(ts.endsWith("Z") || ts.includes("+") ? ts : ts + "Z");
-  if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const t = tsMs(ts);
+  if (Number.isNaN(t)) return "";
+  return new Date(t).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
+function ageText(min) {
+  if (min == null || Number.isNaN(Number(min))) return "";
+  const m = Math.max(0, Math.round(Number(min)));
+  if (m < 60) return m + "m old";
+  if (m < 48 * 60) return Math.floor(m / 60) + "h " + (m % 60) + "m old";
+  return Math.floor(m / 1440) + "d old";
 }
-function agentBy(name) {
-  return ((store.state && store.state.agents) || []).find((a) => a.name === name) || {};
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+function tick(sym, name, mint) {
+  const raw = (sym || name || (mint || "").slice(0, 5) || "?").replace(/^\$/, "");
+  return raw.length > 10 ? raw.slice(0, 10) : raw;
+}
+function agentBy(name) { return ((store.state && store.state.agents) || []).find((a) => a.name === name) || {}; }
+function botName() { return (store.account && store.account.telegram && store.account.telegram.bot) || ""; }
+function mode() { return (store.state && store.state.mode) || "PAPER"; }
 
-function prettyKey(k) {
-  return k.replace(/_/g, " ").replace(/\busd\b/i, "USD").replace(/\bpct\b/i, "%");
+function coinAvatar(mint, symbol, size = 40, badge = "") {
+  const m = meta[mint] || {};
+  const letter = esc((tick(symbol, m.symbol, mint)[0] || "?").toUpperCase());
+  const hue = [...(mint || "x")].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 360, 7);
+  const img = m.image ? `<img src="${esc(m.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : "";
+  return `<span class="cav" style="width:${size}px;height:${size}px;background:hsl(${hue} 45% 28%)"><span class="cav-l">${letter}</span>${img}${badge ? `<span class="cav-b ${badge}"></span>` : ""}</span>`;
 }
 
 /* ---------- data load ---------- */
 
 async function refreshAll() {
-  if (store.demo === "error") {
-    store.error = "demo";
-    store.retryIn = 5;
-    return;
-  }
-  const t = token(), p = dataPath();
-  if (!t || !p) {
-    store.loading = false;
-    return;
-  }
+  if (store.demo === "error") { store.error = "demo"; store.retryIn = 5; return; }
+  if (!token() || !dataPath()) { store.loading = false; return; }
   try {
     const [state, activity, account, settings, chart] = await Promise.all([
-      loadJson("state.json"),
-      loadJson("activity.json"),
-      loadJson("account.json"),
-      loadJson("settings.json"),
+      loadJson("state.json"), loadJson("activity.json"), loadJson("account.json"), loadJson("settings.json"),
       loadJson("chart/" + store.range + ".json").catch(() => loadJson("chart.json")),
     ]);
-    store.state = state;
-    store.activity = activity;
-    store.account = account;
-    store.settings = settings;
+    Object.assign(store, { state, activity, account, settings, error: null, retryIn: 0, loading: false });
     store.chart[store.range] = chart;
     store.updatedAt = state.updatedAt || new Date().toISOString();
-    store.error = null;
-    store.retryIn = 0;
-    store.loading = false;
-    prefetchKnown();
-  } catch (err) {
-    store.error = err;
-    store.retryIn = 15;
-    store.loading = false;
-  }
-}
-
-function knownMints() {
-  const set = new Set();
-  const push = (m) => { if (m) set.add(m); };
-  ((store.activity && store.activity.rows) || []).forEach((r) => push(r.mint));
-  ((store.state && store.state.activity) || []).forEach((r) => push(r.mint));
-  const sc = agentBy("scanner");
-  (sc.feed || []).forEach((f) => push(f.mint));
-  if (agentBy("auditor").currentMint) push(agentBy("auditor").currentMint);
-  Object.values(store.decisions).forEach((d) => (d.decisions || []).forEach((x) => push(x.mint)));
-  if (route.mint) push(route.mint);
-  return [...set];
-}
-
-async function prefetchKnown() {
-  const jobs = [];
-  for (const name of AGENT_ORDER) {
-    if (!store.decisions[name]) {
-      jobs.push(loadJson("agents/" + name + "/decisions.json").then((d) => { store.decisions[name] = d; }).catch(() => {}));
+    if (store.pending) {
+      const p = store.pending;
+      const done = (p.action === "resume" && !state.entriesPaused) || (p.action !== "resume" && state.entriesPaused);
+      if (done || Date.now() - p.at > 10 * 60e3) store.pending = null;
     }
+    fetchMeta(knownMints()).then(() => { if (route.screen !== "coin") softRender(); });
+  } catch (err) {
+    store.error = err; store.retryIn = 15; store.loading = false;
   }
-  await Promise.all(jobs);
 }
-
+function knownMints() {
+  const s = store.state || {};
+  const out = [];
+  ((store.activity && store.activity.rows) || []).forEach((r) => out.push(r.mint));
+  (s.recent || []).forEach((r) => out.push(r.mint));
+  (agentBy("scanner").feed || []).forEach((f) => out.push(f.mint));
+  (s.openPositions || []).forEach((p) => out.push(p.mint));
+  const ex = agentBy("executor").last; if (ex) out.push(ex.mint);
+  return out.filter(Boolean).slice(0, 60);
+}
 async function ensureCoin(mint) {
-  if (!mint) return null;
-  if (store.demo === "empty") {
-    store.coins[mint] = null;
-    return null;
-  }
   if (store.coins[mint] === undefined) {
-    try { store.coins[mint] = await loadJson("coin/" + mint + ".json"); }
-    catch { store.coins[mint] = null; }
+    try { store.coins[mint] = await loadJson("coin/" + mint + ".json"); } catch { store.coins[mint] = null; }
   }
   return store.coins[mint];
 }
-async function ensureAudit(mint) {
-  if (!mint) return null;
-  if (store.demo === "empty") {
-    store.audits[mint] = { empty: true };
-    return store.audits[mint];
-  }
-  if (store.audits[mint] === undefined) {
-    try { store.audits[mint] = await loadJson("audit/" + mint + ".json"); }
-    catch { store.audits[mint] = { missing: true }; }
-  }
-  return store.audits[mint];
-}
 async function ensureChart(range) {
-  if (!store.chart[range]) {
-    try { store.chart[range] = await loadJson("chart/" + range + ".json"); }
-    catch { store.chart[range] = { range, points: [], marks: [], startValue: store.state && store.state.balance }; }
-  }
+  try { store.chart[range] = await loadJson("chart/" + range + ".json"); }
+  catch { if (!store.chart[range]) store.chart[range] = { range, points: [], marks: [], startValue: store.state && store.state.balance }; }
   return store.chart[range];
 }
-
-/* ---------- render helpers ---------- */
-
-function setTabs() {
-  const hide = route.screen === "lock";
-  tabbar.style.display = hide ? "none" : "flex";
-  tabbar.querySelectorAll(".tab").forEach((btn) => {
-    btn.classList.toggle("on", btn.dataset.tab === route.tab);
-  });
+async function ensureDecisions(name) {
+  try { store.decisions[name] = await loadJson("agents/" + name + "/decisions.json"); } catch { store.decisions[name] = store.decisions[name] || null; }
+  return store.decisions[name];
 }
+
+/* ---------- pieces ---------- */
 
 function showBanner() {
-  if (!store.error || store.demo === "empty") {
-    banner.hidden = true;
-    return;
-  }
-  const last = store.updatedAt ? fmtTime(store.updatedAt) : "never";
+  if (!store.error || store.demo === "empty") { banner.hidden = true; return; }
   banner.hidden = false;
-  banner.textContent = `Desk offline · retrying in ${Math.max(0, store.retryIn)}s · last update ${last}`;
+  banner.textContent = `Desk offline · retrying in ${Math.max(0, store.retryIn)}s · last update ${store.updatedAt ? fmtTime(store.updatedAt) : "never"}`;
 }
 
-function navBar({ title, back, brand, tools }) {
-  return `<div class="nav">
-    ${back ? `<button class="icon-btn" data-act="back" type="button" aria-label="Back">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M15 5 8 12l7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>` : ""}
-    ${brand || (title ? `<div class="nav-title">${escapeHtml(title)}</div>` : "")}
-    <div class="nav-spacer"></div>
-    ${tools || ""}
-  </div>`;
+const ICON_BACK = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M15 5 8 12l7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const CHEV = `<svg width="9" height="14" viewBox="0 0 9 14" fill="none"><path d="m1.5 1.5 5.5 5.5-5.5 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+function deskStatus() {
+  const s = store.state || {};
+  if (store.pending) return { cls: "pending", label: store.pending.action === "resume" ? "Resuming…" : store.pending.action === "stop" ? "Stopping…" : "Pausing…" };
+  if (s.deskStopped) return { cls: "stopped", label: "Stopped" };
+  if (s.entriesPaused) return { cls: "paused", label: "Paused" };
+  return { cls: mode() === "LIVE" ? "live" : "paper", label: mode() === "LIVE" ? "Live" : "Paper" };
 }
 
-function homeNav() {
-  return navBar({
-    brand: `<button class="nav-brand" data-act="account" type="button">Grok Bot <span>›</span></button>`,
-    tools: `<button class="icon-btn" data-act="search" type="button" aria-label="Search">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.8"/><path d="M16 16l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-    </button>
-    <button class="icon-btn" data-act="account" type="button" aria-label="Account">
-      <span class="avatar">A</span>
-    </button>
-    <button class="icon-btn" data-act="bell" type="button" aria-label="Notifications">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M10 19a2 2 0 0 0 4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-      <span class="bell-dot${hasUnread() ? " on" : ""}"></span>
-    </button>`,
-  });
+function sizingLine() {
+  const s = store.state || {};
+  const z = s.sizing || {};
+  const open = (s.openPositions || []).length;
+  const how = z.mode === "compounder" ? `Compounder ${Number(z.compounderPct || 60)}%` : `${Number(z.stackPct || 8)}% of stack · min ${money(z.minTicket, 0)}`;
+  return `fomo · ${how} · ${open} open`;
 }
 
-function hasUnread() {
-  const rows = (store.activity && store.activity.rows) || [];
-  if (!rows.length) return false;
-  const seen = localStorage.getItem(LS_SEEN) || "";
-  return rows.some((r) => (r.ts || "") > seen);
-}
-
-function paperBadge(mode) {
-  return mode === "PAPER" ? `<span class="paper-pill">PAPER</span>` : "";
-}
-
-const ODO_SPIN_MS = 600;
-let lastOdoText = null;
-
-function odometerHtml(value) {
-  const text = money(value);
-  const digits = "0123456789";
-  return `<div class="odometer" data-odo="${escapeHtml(text)}">${[...text].map((ch, i) =>
-    /[0-9]/.test(ch)
-      ? `<span class="odo-reel" data-i="${i}" data-d="${ch}"><span class="odo-strip">${[...digits].map((n) => `<span class="odo-digit">${n}</span>`).join("")}</span></span>`
-      : `<span class="odo-char">${escapeHtml(ch)}</span>`
-  ).join("")}</div>`;
-}
-
-function reelWindowHeight(reel) {
-  const h = reel.getBoundingClientRect().height;
-  if (h > 0) return h;
-  const fs = parseFloat(getComputedStyle(reel).fontSize);
-  return fs > 0 ? fs : 72;
-}
-
-function settleStrip(strip, digit, height) {
-  const y = -(Number(digit) * height);
-  strip.style.transform = `translate3d(0, ${y}px, 0)`;
-}
-
-function prevDigitForReel(prevText, nextText, index) {
-  if (!prevText || !nextText) return 0;
-  const i = index + (prevText.length - nextText.length);
-  if (i < 0 || i >= prevText.length) return 0;
-  const ch = prevText[i];
-  return /[0-9]/.test(ch) ? Number(ch) : 0;
-}
-
-function clearReelSpin(reel) {
-  const strip = reel.querySelector(".odo-strip");
-  if (reel._odoTimer) { clearTimeout(reel._odoTimer); reel._odoTimer = 0; }
-  if (reel._odoEnd && strip) {
-    strip.removeEventListener("transitionend", reel._odoEnd);
+function homeChartPayload() {
+  const st = store.state || {};
+  const ch = store.chart[store.range] || { points: [], marks: [], startValue: st.balance };
+  let startMs;
+  if (RANGE_MS[store.range]) startMs = Date.now() - RANGE_MS[store.range];
+  else if (store.range === "LIVE") {
+    const pts = ch.points || [];
+    startMs = pts.length ? Math.min(tsMs(pts[0].ts), Date.now() - 3600e3) : Date.now() - 3600e3;
   }
-  reel._odoEnd = null;
+  return { ch, startMs };
 }
 
-function spinOdometer(root, prevText) {
-  if (!root) return;
-  const nextText = root.dataset.odo || "";
-  const isFirst = prevText == null || prevText === "";
-  const changed = !isFirst && prevText !== nextText;
-  const animate = changed && !reduced();
-  const reels = [...root.querySelectorAll(".odo-reel")];
+const GOALS = [2, 5, 10, 25, 50, 100, 250, 500, 1000];
+function nextGoal(mult) { return GOALS.find((g) => g > mult + 1e-9) || GOALS[GOALS.length - 1]; }
 
-  const snapReel = (reel, digit) => {
-    clearReelSpin(reel);
-    const strip = reel.querySelector(".odo-strip");
-    if (!strip) return;
-    reel.classList.remove("anim");
-    strip.style.transition = "none";
-    settleStrip(strip, digit, reelWindowHeight(reel));
-  };
-
-  reels.forEach((reel) => {
-    const d = Number(reel.dataset.d);
-    const strip = reel.querySelector(".odo-strip");
-    if (!strip) return;
-    const from = animate ? prevDigitForReel(prevText, nextText, Number(reel.dataset.i || 0)) : d;
-
-    clearReelSpin(reel);
-    reel.classList.remove("anim");
-    strip.style.transition = "none";
-    settleStrip(strip, from, reelWindowHeight(reel));
-    void strip.offsetHeight;
-
-    if (!animate || from === d) {
-      snapReel(reel, d);
-      return;
-    }
-
-    const delay = 30 * (reels.length - 1 - Number(reel.dataset.i || 0));
-    const onEnd = (e) => {
-      if (e && e.target && e.target !== strip) return;
-      if (e && e.propertyName && e.propertyName !== "transform") return;
-      snapReel(reel, d);
-    };
-    reel._odoEnd = onEnd;
-
-    reel._odoTimer = setTimeout(() => {
-      strip.addEventListener("transitionend", onEnd);
-      strip.style.transition = "";
-      reel.classList.add("anim");
-      settleStrip(strip, d, reelWindowHeight(reel));
-      reel._odoTimer = setTimeout(onEnd, ODO_SPIN_MS + 80);
-    }, Math.max(0, delay));
-  });
-
-  lastOdoText = nextText;
-
-  const resettleIdle = () => {
-    if (!root.isConnected) return;
-    root.querySelectorAll(".odo-reel").forEach((reel) => {
-      if (reel.classList.contains("anim") || reel._odoTimer) return;
-      const strip = reel.querySelector(".odo-strip");
-      if (!strip) return;
-      settleStrip(strip, Number(reel.dataset.d), reelWindowHeight(reel));
-    });
-  };
-  requestAnimationFrame(resettleIdle);
-  if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(resettleIdle).catch(() => {});
-  }
-}
-
-function activityRow(r) {
-  if (!r) return "";
-  const kind = (r.kind || "").toLowerCase();
-  const act = kind === "rejected" ? "audit" : "coin";
-  return `<button class="row" type="button" data-act="${act}" data-mint="${escapeHtml(r.mint || "")}">
-    <div class="mid"><div class="title">${escapeHtml(r.title || kind)}</div>
-    <div class="sub">${escapeHtml(r.subtitle || "")}</div></div>
-    <div class="right ${kind === "sold" ? "green" : kind === "stopped" ? "red" : ""}">${escapeHtml(r.value || "")}</div>
-  </button>`;
-}
-
-function scannerFeed(card) {
-  const feed = card.feed || [];
-  if (!feed.length || store.demo === "empty") {
-    return `<div class="feed muted">Listening for graduations</div>`;
-  }
-  return `<div class="feed">${feed.slice(0, 5).map((f) => {
-    const kill = (f.verdict || "").toLowerCase() !== "pass";
-    return `<div>${kill
-      ? `<span class="strike">${escapeHtml(f.name || f.mint)}</span><span class="kill-reason">${escapeHtml(f.reason || "")}</span>`
-      : `${escapeHtml(f.name || f.mint)} <span class="muted">→ auditor</span>`}</div>`;
-  }).join("")}</div>`;
-}
-
-function auditorLayers(card) {
-  const layers = card.layers || [];
-  const cells = [];
-  for (let i = 1; i <= 8; i++) {
-    const L = layers.find((x) => x.layer === i);
-    let cls = "wait";
-    if (L && L.pass === true) cls = "ok";
-    else if (L && L.pass === false) cls = "no";
-    cells.push(`<div class="layer-strip ${cls}"></div>`);
-  }
-  return `<div class="layers-grid">${cells.join("")}</div>`;
-}
-
-function agentCardHtml(name) {
+function agentCard(name) {
   const a = agentBy(name);
+  const st = store.state || {};
+  const dot = a.status === "paused" ? "paused" : "on";
   if (name === "scanner") {
-    return `<button class="agent-card" type="button" data-act="tab" data-tab="agents" style="border-radius:${radius()}px">
-      <div class="kicker" style="color:var(--cyan)">Scanner</div>
-      <div class="count">${store.demo === "empty" ? "0" : (a.pools ?? 0)} pools</div>
-      ${scannerFeed(a)}
-    </button>`;
+    const feed = (a.feed || []).slice(0, 3);
+    return `<article class="acard" data-act="agent" data-name="scanner">
+      <header><span class="aico teal">${svgRadar()}</span><div><div class="aname">Scanner</div><div class="asub"><i class="dot ${dot}"></i>${(a.scannedTotal ?? 0).toLocaleString("en-US")} coins scanned</div></div></header>
+      <div class="alist">${feed.length ? feed.map((f) => `<button class="arow" type="button" data-act="coin" data-mint="${esc(f.mint)}">
+          ${coinAvatar(f.mint, f.symbol, 28)}<span class="arow-t">${esc(tick(f.symbol, f.name, f.mint))}</span>
+          <span class="arow-m">${f.liquidityUsd != null ? "liq " + compactMoney(f.liquidityUsd) : ""}</span>
+          <span class="badge ${f.verdict === "pass" ? "g" : "x"}">${f.verdict === "pass" ? "pass" : "kill"}</span></button>`).join("")
+        : `<div class="aempty">Listening for new pools</div>`}</div>
+    </article>`;
   }
   if (name === "auditor") {
-    const empty = store.demo === "empty" || !(a.takenApart || a.layers && a.layers.length);
-    return `<button class="agent-card" type="button" data-act="tab" data-tab="agents" style="border-radius:${radius()}px">
-      <div class="kicker">Auditor</div>
-      <div class="count">${empty ? "0" : (a.takenApart ?? 0)} taken apart</div>
-      ${empty ? `<div class="feed muted">No coin taken apart yet</div>` : auditorLayers(a)}
-      <div class="headline">${escapeHtml(empty ? "" : (a.headline || ""))}</div>
-      ${empty ? "" : `<div class="muted">${a.rejected ?? 0} rejected</div>`}
-    </button>`;
+    const layers = a.layers || [];
+    const pick = ["Dev wallet", "Top 10 holders", "Liquidity", "Mint authority"].map((n) => layers.find((l) => l.name === n)).filter(Boolean).slice(0, 3);
+    return `<article class="acard" data-act="agent" data-name="auditor">
+      <header><span class="aico orange">${svgShield()}</span><div><div class="aname">Auditor <span class="aalias">dev watch</span></div><div class="asub"><i class="dot ${dot}"></i>${a.takenApart ?? 0} taken apart today · ${a.rejected ?? 0} rejected</div></div></header>
+      <div class="alist">${pick.length ? pick.map((l) => `<div class="arow"><span class="arow-t">${esc(l.name)}</span><span class="arow-m">${esc(l.value || "")}</span><span class="badge ${l.pass === true ? "g" : l.pass === false ? "r" : "x"}">${l.pass === true ? "ok" : l.pass === false ? "fail" : "—"}</span></div>`).join("")
+        : `<div class="aempty">No coin reached the Auditor today. It checks dev wallet, top holders, LP lock and bundles before any buy.</div>`}</div>
+      ${a.currentMint ? `<button class="aline" type="button" data-act="coin" data-mint="${esc(a.currentMint)}">${esc(a.headline || "")} ${CHEV}</button>` : ""}
+    </article>`;
   }
   if (name === "analyst") {
-    return `<button class="agent-card" type="button" data-act="tab" data-tab="agents" style="border-radius:${radius()}px">
-      <div class="kicker" style="color:var(--yellow)">Analyst</div>
-      <div class="count">Scoring</div>
-      <canvas class="score-ring" width="140" height="140" style="width:120px;height:120px;margin:0 auto;display:block"></canvas>
-    </button>`;
+    const last = a.last;
+    const minScore = ((store.settings && store.settings.settings) || {}).min_score ?? 70;
+    return `<article class="acard" data-act="agent" data-name="analyst">
+      <header><span class="aico yellow">${svgSpark()}</span><div><div class="aname">Analyst</div><div class="asub"><i class="dot ${dot}"></i>${a.todayCount ?? 0} scored today</div></div></header>
+      <div class="aring"><canvas class="ring" data-ring="analyst" width="96" height="96"></canvas>
+        <div class="aring-t"><div class="muted">buys at score</div><div class="big">${esc(String(minScore))}+</div>
+        <div class="muted">${last ? "last " + esc(tick(null, null, last.mint)) + " · " + esc(String(last.score)) : "no coin scored yet"}</div></div></div>
+    </article>`;
   }
   if (name === "executor") {
-    const size = a.sizeUsd != null ? money(a.sizeUsd) : "—";
-    const sp = a.stackPct != null ? Number(a.stackPct).toFixed(1) : "—";
-    return `<button class="agent-card" type="button" data-act="tab" data-tab="agents" style="border-radius:${radius()}px">
-      <div class="kicker" style="color:var(--green)">Executor</div>
-      <div class="count">${a.trades ?? 0} trades</div>
-      <div class="muted">${size} · ${sp}% of stack</div>
-      <div class="headline" style="margin-top:auto">${escapeHtml(a.headline || "Executing... 0%")}</div>
-    </button>`;
+    const mult = Number(st.multiplierAll || 1);
+    const goal = nextGoal(mult);
+    const z = st.sizing || {};
+    const last = a.last;
+    return `<article class="acard" data-act="agent" data-name="executor">
+      <header><span class="aico purple">${svgBolt()}</span><div><div class="aname">Executor${z.mode === "compounder" ? ` <span class="aalias">compounder</span>` : ""}</div><div class="asub yellow"><i class="dot on"></i>${mult.toFixed(2)}x now</div></div></header>
+      <div class="aring"><canvas class="ring" data-ring="executor" width="96" height="96"></canvas>
+        <div class="aring-t"><div class="muted">next goal</div><div class="big">${money(goal * Number(st.startStack || 0))}</div>
+        <div class="green">${z.nextBuy != null ? "buy " + money(z.nextBuy) : esc(z.nextBuyNote || "no free cash")}</div></div></div>
+      ${last ? `<button class="abtn" type="button" data-act="coin" data-mint="${esc(last.mint)}">${coinAvatar(last.mint, null, 22)} ${esc(last.status === "skipped" ? "Skipped" : "Bought")} ${esc(tick(null, null, last.mint))}</button>`
+        : `<div class="aempty">No paper buy yet</div>`}
+    </article>`;
   }
-  const stop = a.stopPct != null ? `-${Number(a.stopPct)}%` : "—";
-  const trail = a.trailPct != null ? `${Number(a.trailPct)}%` : "—";
-  return `<button class="agent-card" type="button" data-act="tab" data-tab="agents" style="border-radius:${radius()}px">
-    <div class="kicker" style="color:var(--pink)">Risk</div>
-    <div class="count">Guarding</div>
-    <div class="headline">${escapeHtml(a.headline || "Guarding")}</div>
-    <div style="margin-top:10px">
-      <span class="pill pill-red">stop ${escapeHtml(stop)}</span>
-      <span class="pill pill-green">trail ${escapeHtml(trail)}</span>
-    </div>
+  const open = st.openPositions || [];
+  return `<article class="acard" data-act="agent" data-name="risk">
+    <header><span class="aico red">${svgTri()}</span><div><div class="aname">Risk</div><div class="asub"><i class="dot ${dot}"></i>${open.length} open · guarding</div></div></header>
+    <div class="pills"><span class="pill r">stop -${esc(String(a.stopPct ?? "—"))}%</span><span class="pill g">trail ${esc(String(a.trailPct ?? "—"))}%</span></div>
+    <div class="alist">${open.length ? open.map((p) => `<button class="arow" type="button" data-act="coin" data-mint="${esc(p.mint)}">${coinAvatar(p.mint, p.symbol, 28)}<span class="arow-t">${esc(tick(p.symbol, p.name, p.mint))}</span><span class="arow-m">${money(p.sizeUsd)} in</span></button>`).join("")
+      : `<div class="aempty">${a.lastExit ? "Last exit: " + esc(a.lastExit.reason || "") + " · " + signedMoney(a.lastExit.pnlUsd) : `Nothing open. Sells on the stop, the trail or the ${esc(String(((store.settings && store.settings.settings) || {}).timeout_h ?? 3))}h timeout.`}</div>`}</div>
+  </article>`;
+}
+
+function svgRadar() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 12 18 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`; }
+function svgShield() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`; }
+function svgSpark() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 16l5-5 4 4 7-8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`; }
+function svgBolt() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg>`; }
+function svgTri() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3 2 21h20L12 3Z"/></svg>`; }
+
+function parseValue(v) {
+  const parts = String(v || "").split(" · ");
+  return { amount: parts[0] || "", sub: parts.slice(1).join(" · ") };
+}
+
+function tradeRow(r) {
+  const kind = (r.kind || "").toLowerCase();
+  const badge = kind === "bought" ? "buy" : kind === "stopped" ? "stop" : "sell";
+  const { amount, sub } = parseValue(r.value);
+  const title = (r.title || kind).replace(r.name || "\u0000", tick(r.symbol, r.name, r.mint));
+  const amtCls = kind === "bought" ? "" : amount.startsWith("-") ? "red" : "green";
+  return `<button class="row" type="button" data-act="coin" data-mint="${esc(r.mint || "")}">
+    ${coinAvatar(r.mint, r.symbol, 42, badge)}
+    <div class="mid"><div class="title">${esc(title)}</div><div class="sub">${esc([r.subtitle, fmtTime(r.ts)].filter(Boolean).join(" · "))}</div></div>
+    <div class="right"><div class="amt ${amtCls}">${esc(amount)}</div><div class="sub">${esc(sub)}</div></div>
   </button>`;
 }
-
-function radius() {
-  const width = Math.max(200, (window.innerWidth || 390) - 32);
-  return 42 * width / 504;
+function decisionRow(d) {
+  const t = tick(d.symbol, d.name, d.mint);
+  const title = d.agent === "scanner" ? (d.verdict === "pass" ? `Passed ${t} to Auditor` : `Skipped ${t}`)
+    : d.agent === "auditor" ? (d.verdict === "rejected" ? `Rejected ${t}` : `Cleared ${t}`)
+    : d.agent === "analyst" ? `Scored ${t}` : `Didn't buy ${t}`;
+  const right = d.agent === "analyst" && d.score != null ? `score ${d.score}` : d.liquidityUsd != null ? compactMoney(d.liquidityUsd) : "";
+  return `<button class="row" type="button" data-act="coin" data-mint="${esc(d.mint || "")}">
+    ${coinAvatar(d.mint, d.symbol, 42, "info")}
+    <div class="mid"><div class="title">${esc(title)}</div><div class="sub">${esc([d.agent, d.reason, fmtTime(d.ts)].filter(Boolean).join(" · "))}</div></div>
+    <div class="right"><div class="amt muted">${esc(right)}</div><div class="sub">${d.agent === "scanner" ? "liq" : ""}</div></div>
+  </button>`;
 }
-
-function runningCount() {
-  return ((store.state && store.state.agents) || []).filter((a) => a.status !== "paused").length;
+function activityHtml(limit) {
+  const trades = (store.activity && store.activity.rows) || (store.state && store.state.activity) || [];
+  if (trades.length) return trades.slice(0, limit).map(tradeRow).join("");
+  const recent = ((store.state && store.state.recent) || []).slice(0, limit);
+  return `<div class="note-row">No paper trades yet. Latest desk decisions:</div>${recent.map(decisionRow).join("") || `<div class="empty-note">Nothing yet</div>`}`;
 }
 
 /* ---------- screens ---------- */
 
 function renderLock() {
-  view.classList.add("locked");
   view.innerHTML = `<div class="lock">
-    <h1>Grok Bot</h1>
+    <div class="lock-av">G</div>
+    <h1>Trading Desk</h1>
     <p class="muted">Open the link in Safari (Telegram: tap … → Open in Safari). After Add to Home Screen, paste the link once inside the Home Screen app. The token stays on this phone and is never sent to a server.</p>
     <form class="lock-form" data-act="unlock-form" method="dialog">
       <label class="lock-label" for="unlock-input">Private desk link</label>
@@ -569,520 +425,430 @@ function renderLock() {
     </form>
   </div>`;
 }
-
 function renderLoading() {
-  view.innerHTML = `${homeNav()}
-    <div class="balance-wrap"><div class="skel" style="height:72px;width:70%;border-radius:8px"></div>
-    <div class="skel" style="height:18px;width:40%;margin-top:12px"></div></div>
-    <div class="chart-card"><div class="skel" style="height:180px;border-radius:12px"></div></div>
-    <div class="h-section"><div class="skel" style="height:24px;width:50%"></div></div>
-    <div style="padding:0 16px"><div class="skel" style="height:200px;border-radius:24px"></div></div>`;
+  view.innerHTML = `<div class="topbar"><span></span><div class="tb-title">Trading Desk</div><span></span></div>
+    <div class="pad"><div class="skel" style="height:22px;width:50%"></div><div class="skel" style="height:64px;width:75%;margin-top:18px"></div>
+    <div class="skel" style="height:200px;margin-top:18px;border-radius:16px"></div><div class="skel" style="height:180px;margin-top:18px;border-radius:22px"></div></div>`;
+}
+
+/* odometer (kept: settles on iOS WebKit) */
+let lastOdoText = null;
+function odometerHtml(value) {
+  const text = money(value);
+  return `<div class="odometer" data-odo="${esc(text)}">${[...text].map((ch, i) => /[0-9]/.test(ch)
+    ? `<span class="odo-reel" data-i="${i}" data-d="${ch}"><span class="odo-strip">${[..."0123456789"].map((n) => `<span class="odo-digit">${n}</span>`).join("")}</span></span>`
+    : `<span class="odo-char">${esc(ch)}</span>`).join("")}</div>`;
+}
+function reelH(reel) { const h = reel.getBoundingClientRect().height; if (h > 0) return h; const fs = parseFloat(getComputedStyle(reel).fontSize); return fs > 0 ? fs : 64; }
+function settle(strip, d, h) { strip.style.transform = `translate3d(0, ${-(Number(d) * h)}px, 0)`; }
+function spinOdometer(root, prevText) {
+  if (!root) return;
+  const next = root.dataset.odo || "";
+  const animate = prevText && prevText !== next && !reduced();
+  root.querySelectorAll(".odo-reel").forEach((reel) => {
+    const strip = reel.querySelector(".odo-strip");
+    const d = Number(reel.dataset.d);
+    let from = d;
+    if (animate) { const i = Number(reel.dataset.i) + (prevText.length - next.length); const ch = prevText[i]; from = /[0-9]/.test(ch || "") ? Number(ch) : 0; }
+    reel.classList.remove("anim"); strip.style.transition = "none"; settle(strip, from, reelH(reel)); void strip.offsetHeight;
+    if (from !== d) { strip.style.transition = ""; reel.classList.add("anim"); settle(strip, d, reelH(reel)); setTimeout(() => { reel.classList.remove("anim"); strip.style.transition = "none"; settle(strip, d, reelH(reel)); }, 700); }
+  });
+  lastOdoText = next;
+  const re = () => root.isConnected && root.querySelectorAll(".odo-reel").forEach((reel) => { if (!reel.classList.contains("anim")) settle(reel.querySelector(".odo-strip"), reel.dataset.d, reelH(reel)); });
+  requestAnimationFrame(re);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(re).catch(() => {});
 }
 
 function renderHome() {
   const st = store.state || {};
-  const mode = st.mode || "PAPER";
-  const ch = store.chart[store.range] || { points: [], marks: [], startValue: st.balance };
-  const emptyChart = store.demo === "empty" || !ch.points || (ch.points.length <= 1 && !(ch.marks || []).length);
-  const rows = store.demo === "empty" ? [] : (st.activity || (store.activity && store.activity.rows) || []).slice(0, 5);
-  const today = st.todayPct;
-  const mult = st.multiplier;
-  const bal = st.balance;
+  const ds = deskStatus();
+  const pnl = Number(st.allTimePnl || 0);
+  const up = pnl >= 0;
+  const running = AGENT_ORDER.filter((n) => agentBy(n).status !== "paused").length;
   const prevOdo = lastOdoText ?? $(".odometer")?.dataset.odo ?? null;
-  view.innerHTML = `${homeNav()}
-    <div class="balance-wrap">
-      <div class="balance-row">${odometerHtml(bal)}${paperBadge(mode)}</div>
-      <div class="meta-row">
-        <span class="${Number(today) < 0 ? "red" : "green"}">${pct(today)}</span>
-        <span class="mult">${Number(mult).toFixed(2)}×</span>
+  const scrollX = $(".carousel")?.scrollLeft || 0;
+  view.innerHTML = `
+    <div class="topbar">
+      <button class="icon-btn" type="button" data-act="tg" aria-label="Back to Telegram">${ICON_BACK}</button>
+      <div class="tb-title">Trading Desk</div>
+      <button class="share-btn" type="button" data-act="share">Share</button>
+    </div>
+    <div class="pad">
+      <div class="bot-row">
+        <button class="bot" type="button" data-act="account"><span class="bot-av">G</span><span class="bot-name">Grok Bot</span>${CHEV}</button>
+        <button class="mode-pill ${ds.cls}" type="button" data-act="stop-sheet"><i></i>${esc(ds.label)}</button>
+      </div>
+      <div class="subline">${esc(sizingLine())}</div>
+      <div class="balance">${odometerHtml(st.balance)}</div>
+      <div class="gain-row">
+        <span class="gain ${up ? "green" : "red"}">${up ? "▲" : "▼"} ${money(Math.abs(pnl))} (${pct(Math.abs(Number(st.allTimePct || 0)))})</span>
+        <span class="mult-pill ${up ? "" : "down"}">${Number(st.multiplierAll || 1).toFixed(2)}x</span>
       </div>
     </div>
-    <div class="chart-card">
-      <canvas id="home-chart"></canvas>
-      <div class="chart-empty" ${emptyChart ? "" : "hidden"}>Waiting for the first trade</div>
-      <div class="ranges">${RANGES.map((r) => `<button type="button" data-act="range" data-range="${r}" class="${r === store.range ? "on" : ""}">${r}</button>`).join("")}</div>
-    </div>
-    <div class="h-section">Agents · ${runningCount()} running</div>
-    <div class="carousel">${AGENT_ORDER.map(agentCardHtml).join("")}</div>
-    <div class="h-section">Activity <button class="link" type="button" data-act="tab" data-tab="activity">See all</button></div>
-    ${rows.length ? rows.map(activityRow).join("") : `<div class="empty-note">Nothing yet tonight</div>`}`;
-
+    <div class="chart-wrap"><canvas id="home-chart"></canvas></div>
+    <div class="chips">${RANGES.map((r) => `<button type="button" data-act="range" data-range="${r}" class="${r === store.range ? "on" : ""}">${r === "LIVE" ? "<i></i>LIVE" : r}</button>`).join("")}</div>
+    <div class="h-row"><h2>Agents</h2><span class="green">${running} running</span></div>
+    <div class="carousel" id="carousel">${AGENT_ORDER.map(agentCard).join("")}</div>
+    <div class="dots" id="dots">${AGENT_ORDER.map((_, i) => `<i class="${i === 0 ? "on" : ""}"></i>`).join("")}</div>
+    <div class="h-row"><h2>Activity</h2><button class="link" type="button" data-act="activity">See all</button></div>
+    <div class="list">${activityHtml(6)}</div>
+    <p class="foot">PAPER · simulated fills on real prices · no orders are placed</p>`;
+  const car = $("#carousel");
+  if (car) {
+    car.scrollLeft = scrollX;
+    const upd = () => {
+      const cards = [...car.children];
+      const idx = cards.reduce((best, c, i) => Math.abs(c.offsetLeft - car.scrollLeft - 16) < Math.abs(cards[best].offsetLeft - car.scrollLeft - 16) ? i : best, 0);
+      $("#dots")?.querySelectorAll("i").forEach((d, i) => d.classList.toggle("on", i === idx));
+    };
+    car.addEventListener("scroll", () => requestAnimationFrame(upd), { passive: true });
+    upd();
+  }
   requestAnimationFrame(() => {
     spinOdometer($(".odometer"), prevOdo);
-    const c = $("#home-chart");
-    if (c) {
-      const payload = emptyChart ? { points: ch.points && ch.points.length ? ch.points : [{ ts: st.updatedAt, value: ch.startValue ?? bal }], marks: [], startValue: ch.startValue ?? bal } : ch;
-      drawLineChart(c, payload, { progress: 1, markFade: 1 });
-    }
-    const ring = $(".score-ring");
-    if (ring) drawScoreRing(ring, store.demo === "empty" ? null : agentBy("analyst").score);
+    drawHomeChart();
+    const mult = Number(st.multiplierAll || 1);
+    const goal = nextGoal(mult);
+    const prev = GOALS[GOALS.indexOf(goal) - 1] || 1;
+    const ringE = $('[data-ring="executor"]');
+    if (ringE) drawRing(ringE, (mult - prev < 0 ? 0 : (mult - 1) / (goal - 1)), goal + "x", "#facc15");
+    const ringA = $('[data-ring="analyst"]');
+    const last = agentBy("analyst").last;
+    if (ringA) drawRing(ringA, last ? Number(last.score) / 100 : 0, last ? String(last.score) : "—", last && last.pass ? "#22c55e" : "#facc15", "score");
   });
 }
-
-function renderAgents() {
-  view.innerHTML = `${navBar({ title: "Agents" })}
-    ${AGENT_ORDER.map((name) => {
-      const d = store.decisions[name] || { name, status: agentBy(name).status, paused: false, decisions: [], todayCount: 0, locked: false };
-      const a = agentBy(name);
-      const count = d.todayCount ?? 0;
-      const locked = !!d.locked;
-      const paused = !!d.paused;
-      const rows = (store.demo === "empty" ? [] : (d.decisions || [])).slice(0, 20);
-      return `<section class="full-agent" id="agent-${name}">
-        <header>
-          <span class="status-dot ${paused ? "paused" : ""}"></span>
-          <strong style="text-transform:capitalize">${escapeHtml(name)}</strong>
-          <span class="muted">${count} today</span>
-          <button class="settings-link" type="button" data-act="settings-group" data-group="${name === "scanner" ? "scanner" : name}">Settings</button>
-          <button class="switch ${paused ? "" : "on"} ${locked ? "locked" : ""}" type="button" data-act="pause-note" data-name="${name}" ${locked ? "disabled" : ""} aria-label="Pause"></button>
-        </header>
-        <div class="decisions">
-          ${rows.length ? rows.map((r) => `<div class="row">
-            <button type="button" class="mid" data-act="${name === "auditor" && (r.verdict === "rejected") ? "audit" : "coin"}" data-mint="${escapeHtml(r.mint || "")}" style="text-align:left">
-              <div class="title">${escapeHtml(r.name || r.mint || "")}</div>
-              <div class="sub">${escapeHtml(fmtTime(r.ts) + " · " + (r.verdict || "") + (r.reason ? " · " + r.reason : ""))}</div>
-            </button>
-            ${r.coin_url ? `<a class="settings-link" href="${escapeHtml(r.coin_url)}" data-act="ext" target="_blank" rel="noopener">FOMO</a>` : ""}
-          </div>`).join("") : `<div class="empty-note">No decisions yet</div>`}
-        </div>
-      </section>`;
-    }).join("")}
-    <p class="note">Pause, resume and settings are read-only on this page. Change them in Telegram.</p>`;
+function drawHomeChart() {
+  const c = $("#home-chart");
+  if (!c) return;
+  const { ch, startMs } = homeChartPayload();
+  const up = Number((store.state || {}).allTimePnl || 0) >= 0;
+  drawBalanceLine(c, ch, { startMs, color: up ? "#22c55e" : "#ef4444" });
 }
 
 function renderActivity() {
-  const rows = store.demo === "empty" ? [] : ((store.activity && store.activity.rows) || []);
-  view.innerHTML = `${navBar({ title: "Activity" })}
-    ${rows.length ? rows.map(activityRow).join("") : `<div class="empty-note">Nothing yet tonight</div>`}`;
+  view.innerHTML = `<div class="topbar"><button class="icon-btn" type="button" data-act="back">${ICON_BACK}</button><div class="tb-title">Activity</div><span class="tb-sp"></span></div>
+    <div class="list">${activityHtml(60)}</div>`;
+}
+
+function renderAgent(name) {
+  const d = store.decisions[name];
+  if (d === undefined) { renderLoading(); ensureDecisions(name).then(render); return; }
+  const rows = (d && d.decisions) || [];
+  const title = name[0].toUpperCase() + name.slice(1);
+  view.innerHTML = `<div class="topbar"><button class="icon-btn" type="button" data-act="back">${ICON_BACK}</button><div class="tb-title">${esc(title)}</div><span class="tb-sp"></span></div>
+    <div class="carousel single">${agentCard(name)}</div>
+    <div class="h-row"><h2>Decisions</h2><span class="muted">${d ? d.todayCount ?? 0 : 0} today</span></div>
+    <div class="list">${rows.length ? rows.slice(0, 40).map((r) => `<button class="row" type="button" data-act="coin" data-mint="${esc(r.mint || "")}">
+      ${coinAvatar(r.mint, null, 36)}<div class="mid"><div class="title">${esc(r.name || r.mint || "")}</div><div class="sub">${esc([fmtTime(r.ts), r.verdict, r.reason].filter(Boolean).join(" · "))}</div></div>
+      <div class="right">${r.score != null ? `<span class="badge g">${esc(String(r.score))}</span>` : ""}</div></button>`).join("") : `<div class="empty-note">No decisions yet</div>`}</div>
+    <p class="foot">Pause or resume ${esc(title)} in Telegram: /pause ${esc(name)} · /resume ${esc(name)}</p>`;
+  requestAnimationFrame(() => {
+    const ringE = $('[data-ring="executor"]');
+    const st = store.state || {};
+    const mult = Number(st.multiplierAll || 1), goal = nextGoal(mult);
+    if (ringE) drawRing(ringE, (mult - 1) / (goal - 1), goal + "x", "#facc15");
+    const ringA = $('[data-ring="analyst"]');
+    const last = agentBy("analyst").last;
+    if (ringA) drawRing(ringA, last ? Number(last.score) / 100 : 0, last ? String(last.score) : "—", "#facc15", "score");
+  });
 }
 
 function renderAccount() {
   const acc = store.account || {};
-  const st = (store.settings && store.settings.settings) || {};
   const grouped = (store.settings && store.settings.grouped) || {};
-  const mode = acc.mode || st.mode || "PAPER";
-  const tg = acc.telegram || {};
-  const webPush = acc.webPush || {};
   const groups = ["desk", "scanner", "auditor", "analyst", "executor", "risk"];
-  view.innerHTML = `${navBar({ title: "Account" })}
-    <div class="group-title">Mode</div>
+  view.innerHTML = `<div class="topbar"><button class="icon-btn" type="button" data-act="back">${ICON_BACK}</button><div class="tb-title">Grok Bot</div><span class="tb-sp"></span></div>
+    <div class="group-title">Desk</div>
     <div class="group">
-      <div class="cell">
-        <div class="lbl">Mode</div>
-        <div class="seg">
-          <button type="button" class="${mode === "PAPER" ? "on" : ""}" disabled>PAPER</button>
-          <button type="button" class="${mode === "LIVE" ? "on" : ""}" data-act="live-note" disabled>LIVE</button>
-        </div>
-      </div>
-      <div class="cell"><div class="lbl">Stack</div><div class="val num">${money(acc.stack)}</div></div>
+      <div class="cell"><div class="lbl">Mode</div><div class="val">${esc(acc.mode || "PAPER")}</div></div>
+      <div class="cell"><div class="lbl">Paper stack</div><div class="val">${money(acc.stack)}</div></div>
+      <div class="cell"><div class="lbl">Telegram bot</div><div class="val">${botName() ? "@" + esc(botName()) : (acc.telegram && acc.telegram.connected ? "Connected" : "—")}</div></div>
     </div>
-    <p class="note">Switching PAPER / LIVE and editing the stack is done in Telegram.</p>
+    ${acc.ticket ? `<p class="note">${esc(acc.ticket)}</p>` : ""}
     <div class="group-title">FOMO</div>
     <div class="group">
-      <a class="cell" href="${escapeHtml(acc.profile_url || "#")}" data-act="ext" target="_blank" rel="noopener">
-        <div class="lbl">Your FOMO profile</div><div class="val">Open</div>
-      </a>
-      <button class="cell" type="button" data-act="invite">
-        <div class="lbl">Invite a friend</div><div class="val">Share</div>
-      </button>
+      <a class="cell" href="${esc(acc.profile_url || "#")}" target="_blank" rel="noopener" data-act="ext"><div class="lbl">Your FOMO profile</div><div class="val">Open ${CHEV}</div></a>
+      <button class="cell" type="button" data-act="share"><div class="lbl">Invite a friend</div><div class="val">Share ${CHEV}</div></button>
     </div>
     ${groups.map((g) => {
       const items = grouped[g] || {};
-      const keys = Object.keys(items);
+      const keys = Object.keys(items).filter((k) => k !== "rpc_url");
       if (!keys.length) return "";
-      return `<div class="group-title" id="settings-${g}">${escapeHtml(g[0].toUpperCase() + g.slice(1))}</div>
-      <div class="group">${keys.map((k) => settingBlock(k, items[k])).join("")}</div>`;
+      return `<div class="group-title">${esc(g[0].toUpperCase() + g.slice(1))}</div><div class="group">${keys.map((k) =>
+        `<div class="cell"><div class="lbl">${esc(k.replace(/_/g, " "))}</div><div class="val">${esc(String(items[k].value ?? ""))}</div></div>`).join("")}</div>`;
     }).join("")}
-    <div class="group-title">Notifications</div>
-    <div class="group">
-      <div class="cell"><div class="lbl">Telegram</div><div class="val">${tg.connected ? "Connected" : "Not connected"}</div></div>
-      <button class="cell" type="button" data-act="test-push"><div class="lbl">Send test push</div><div class="val">Telegram</div></button>
-      <div class="cell"><div class="lbl">Enable notifications</div><div class="val">${webPush.available ? "Available" : "Telegram only"}</div></div>
-    </div>
-    <p class="note">${escapeHtml(webPush.reason || "Plan B has no web push; use Telegram.")}</p>`;
+    <p class="note">Settings are read-only here. Change any of them in Telegram, e.g. “set stop to -8%” or “sizing_mode compounder”.</p>`;
 }
 
-function settingBlock(key, spec) {
-  const typ = (spec && spec.type) || "str";
-  const val = spec && spec.value;
-  const min = spec && spec.min, max = spec && spec.max;
-  if (typ === "bool") {
-    return `<div class="cell"><div class="lbl">${escapeHtml(prettyKey(key))}</div>
-      <button class="switch ${val ? "on" : ""}" type="button" data-act="setting-note" disabled></button></div>`;
-  }
-  if (typ === "choice") {
-    return `<div class="cell"><div class="lbl">${escapeHtml(prettyKey(key))}</div><div class="val">${escapeHtml(String(val ?? ""))}</div></div>`;
-  }
-  if (typ === "int" || typ === "float") {
-    return `<div class="setting-block">
-      <label><span>${escapeHtml(prettyKey(key))}</span><input type="number" disabled value="${escapeHtml(val ?? "")}"></label>
-      ${min != null && max != null ? `<input type="range" disabled min="${min}" max="${max}" step="${typ === "int" ? 1 : "any"}" value="${escapeHtml(val ?? min)}">` : ""}
-    </div>`;
-  }
-  return `<div class="cell"><div class="lbl">${escapeHtml(prettyKey(key))}</div><div class="val">${escapeHtml(String(val ?? ""))}</div></div>`;
-}
+/* ---------- coin detail ---------- */
 
-function renderAudit(audit, coin) {
-  const empty = store.demo === "empty" || !audit || audit.empty || audit.missing || !(audit.layers || []).length;
-  const name = (audit && audit.name) || (coin && coin.name) || "Auditor";
-  if (empty) {
-    view.innerHTML = `${navBar({ title: "Auditor", back: true })}
-      <div class="empty-note">No coin taken apart yet</div>`;
+const LAYER_STATUS = (l) => (l.pass === true ? ["passed", "g"] : l.pass === false ? ["failed", "r"] : ["not checked", "x"]);
+
+function renderCoin(coin, mint) {
+  if (!coin) {
+    view.innerHTML = `<div class="coin-top"><button class="home-link" type="button" data-act="home">‹ Home</button></div><div class="empty-note">The desk has no data for this coin yet.</div>`;
     return;
   }
-  const layers = audit.layers || [];
-  const rejected = audit.verdict === "rejected";
-  const discs = [];
-  for (let i = 1; i <= 8; i++) {
-    const L = layers.find((x) => x.layer === i) || { layer: i, name: "Layer " + i, value: "", pass: null };
-    discs.push(L);
-  }
-  view.innerHTML = `${navBar({ title: name, back: true, tools: paperBadge((store.state || {}).mode) })}
-    <div class="discs" id="discs">
-      <div class="beam" id="beam"></div>
-      ${discs.map((L, i) => `<div class="disc" data-i="${i}" data-pass="${L.pass === true ? "1" : L.pass === false ? "0" : ""}">${escapeHtml((L.name || "").split(" ")[0] || String(i + 1))}</div>`).join("")}
-    </div>
-    <div class="verdict-block">
-      <h2>${rejected ? "Rejected · " + escapeHtml(audit.reason || "") : "Cleared · 8/8 parts"}</h2>
-      <div class="muted">${rejected ? "Grok Bot won't buy " + escapeHtml(name) : "Sent to Executor" + (audit.sizeUsd != null ? " · " + money(audit.sizeUsd) : "")}</div>
-    </div>
-    <div class="layer-rows">
-      ${discs.map((L) => `<div class="layer-row"><span>${escapeHtml(L.name || "")}</span><span class="val ${L.pass === false ? "red" : L.pass === true ? "green" : ""}">${escapeHtml(L.value || "")}</span></div>`).join("")}
-    </div>
-    <div class="toggle-row">
-      <div>Take apart before buying</div>
-      <button class="switch ${((store.settings && store.settings.settings) || {}).auditor_enabled !== false ? "on" : ""}" type="button" data-act="auditor-toggle" disabled></button>
-    </div>
-    <p class="note">This toggle is read-only here. Change it in Telegram. Turning it off requires two confirms.</p>
-    ${audit.coin_url ? `<a class="primary-btn" data-act="ext" href="${escapeHtml(audit.coin_url)}" target="_blank" rel="noopener">Open on FOMO</a>` : ""}`;
+  const m = meta[mint] || {};
+  const sym = tick(coin.symbol, m.symbol, mint);
+  const created = m.created || tsMs(coin.createdAt);
+  const ageMin = created ? (Date.now() - created) / 60000 : coin.ageMin;
+  const trades = coin.trades || [];
+  const buy = [...trades].reverse().find((t) => t.kind === "buy");
+  const sell = buy ? trades.find((t) => t.kind === "sell" && tsMs(t.ts) >= tsMs(buy.ts)) : null;
+  const nowPrice = m.price || coin.price;
+  let change = null, since = "";
+  if (buy && buy.price) { change = ((sell ? sell.price : nowPrice) / buy.price - 1) * 100; since = sell ? "on Grok Bot's paper trade" : "since Grok Bot bought"; }
+  else if (coin.firstSeenPrice && nowPrice) { change = (nowPrice / coin.firstSeenPrice - 1) * 100; since = "since Grok Bot first saw it"; }
+  const starred = (JSON.parse(localStorage.getItem(LS_STARS) || "[]")).includes(mint);
+  const audit = coin.audit && coin.audit.layers ? coin.audit.layers : [];
+  const passed = audit.filter((l) => l.pass === true).length;
+  const scan = coin.scan;
+  const verdict = coin.verdict;
+  const devLayer = audit.find((l) => /^dev/i.test(l.name || ""));
+  const status = buy ? (sell ? "closed" : "open") : scan && scan.verdict !== "pass" ? "passed on it" : audit.length && passed < audit.length ? "rejected" : "watching";
 
-  runBeam();
-}
-
-function runBeam() {
-  const discs = [...view.querySelectorAll(".disc")];
-  const beam = $("#beam");
-  if (!discs.length) return;
-  if (reduced()) {
-    discs.forEach((el) => applyDisc(el));
-    return;
-  }
-  let i = 0;
-  const step = () => {
-    if (i >= discs.length) {
-      if (beam) beam.classList.remove("on");
-      return;
-    }
-    const el = discs[i];
-    const pass = el.dataset.pass;
-    if (pass === "") {
-      // wait for a result the server didn't send — stay on this disc
-      if (beam) {
-        beam.classList.add("on");
-        positionBeam(beam, el);
-      }
-      setTimeout(step, 350);
-      return;
-    }
-    if (beam) {
-      beam.classList.add("on");
-      positionBeam(beam, el);
-    }
-    setTimeout(() => {
-      applyDisc(el);
-      i += 1;
-      setTimeout(step, 150);
-    }, 350);
-  };
-  step();
-}
-function positionBeam(beam, el) {
-  const parent = el.parentElement.getBoundingClientRect();
-  const r = el.getBoundingClientRect();
-  beam.style.top = (r.top - parent.top - 4) + "px";
-  beam.style.height = (r.height + 8) + "px";
-}
-function applyDisc(el) {
-  if (el.dataset.pass === "1") { el.classList.add("ok"); el.textContent = "✓"; }
-  else if (el.dataset.pass === "0") { el.classList.add("no"); el.textContent = "✕"; }
-}
-
-function renderCoin(coin) {
-  const header = navBar({
-    title: (coin && coin.name) || "Coin",
-    back: true,
-    tools: `${paperBadge((store.state || {}).mode)}${coin && coin.auditShield ? `<span class="shield">${escapeHtml(coin.auditShield)}</span>` : ""}`,
-  });
-  if (store.demo === "empty" || !coin) {
-    view.innerHTML = `${header}<div class="empty-note">No coin to show</div>`;
-    return;
-  }
-  const change = coin.priceChangeSinceEntry;
-  const pos = coin.position && !coin.position.closedAt ? coin.position : null;
-  const stats = coin.stats || {};
-  const hold = stats.holders == null ? "n/a" : stats.holders;
-  view.innerHTML = `${header}
-    <div class="muted" style="padding:0 16px">${escapeHtml(coin.symbol || "")} · ${escapeHtml((coin.chain || "solana")[0].toUpperCase() + (coin.chain || "solana").slice(1))} · ${escapeHtml(agoAge(coin.ageMin))}</div>
-    <div class="price-lg num">${coin.price == null ? "—" : money(coin.price, coin.price < 1 ? 6 : 2)}</div>
-    <div class="coin-sub ${change != null && change >= 0 ? "green" : "red"}">${change == null ? "" : (change >= 0 ? "▲ " : "▼ ") + pct(change)}</div>
-    <div class="chart-card" style="height:240px"><canvas id="coin-chart" style="height:220px"></canvas></div>
-    <div class="stats-grid">
-      <div><div class="stat-lbl">Market cap</div><div class="stat-val">${compactMoney(stats.marketCap)}</div></div>
-      <div><div class="stat-lbl">Liquidity</div><div class="stat-val">${compactMoney(stats.liquidity)}</div></div>
-      <div><div class="stat-lbl">24h volume</div><div class="stat-val">${compactMoney(stats.volume24h)}</div></div>
-      <div><div class="stat-lbl">Holders</div><div class="stat-val">${escapeHtml(String(hold))}</div></div>
+  view.innerHTML = `
+    <div class="coin-top">
+      <button class="home-link" type="button" data-act="home">‹ Home</button>
+      <button class="star ${starred ? "on" : ""}" type="button" data-act="star" data-mint="${esc(mint)}" aria-label="Star">${starred ? "★" : "☆"}</button>
     </div>
-    ${pos ? `<div class="exit-card">
-      <h3>Your position · ${money(pos.sizeUsd)} in · Executor</h3>
-      <div>
-        <span class="pill pill-red">stop ${pos.stopPct != null ? ("-" + Number(pos.stopPct).toFixed(1) + "%") : money(pos.stopPrice)}</span>
-        <span class="pill pill-green">trail ${pos.trailLine != null ? money(pos.trailLine, 6) : "off"}</span>
-      </div>
-      <div class="muted" style="margin-top:8px">Time left to timeout: ${escapeHtml(timeoutLeft(pos.timeoutAt))}</div>
+    <div class="pad coin-head">
+      ${coinAvatar(mint, sym, 52)}
+      <div><div class="coin-name">${esc(coin.name || m.name || sym)}</div>
+      <div class="muted">${esc(sym.toUpperCase())} · Solana${ageMin != null ? " · " + esc(ageText(ageMin)) : ""}</div></div>
+      ${coin.coin_url ? `<a class="fomo-pill" href="${esc(coin.coin_url)}" target="_blank" rel="noopener" data-act="ext">FOMO</a>` : ""}
+    </div>
+    <div class="pad">
+      <div class="mc">${m.mc ? compactMoney(m.mc) : coin.price != null ? "$" + Number(coin.price).toPrecision(3) : "—"}</div>
+      <div class="muted small">${m.mc ? "market cap" : "price (market cap loading)"}</div>
+      ${change != null ? `<div class="chg ${change >= 0 ? "green" : "red"}">${change >= 0 ? "▲" : "▼"} ${pct(Math.abs(change), 1)} ${esc(since)}</div>` : ""}
+      <div class="legend"><span>Grok Bot on fomo</span><span>·</span><span class="lb b">B</span><span class="lb s">S</span><span>its trades</span><span>·</span><span class="lr"></span><span>desk calls</span></div>
+    </div>
+    <div class="candle-wrap"><canvas id="coin-chart"></canvas><div class="chart-src muted" id="chart-src"></div></div>
+    ${audit.length ? `<div class="strip-wrap">
+      <div class="strip-h"><span class="muted">auditor · ${audit.length} checks</span><span class="tag ${passed === audit.length ? "g" : "o"}">${passed}/${audit.length}</span></div>
+      <div class="strip">${audit.map((l) => `<i class="${LAYER_STATUS(l)[1]}" title="${esc(l.name)}"></i>`).join("")}</div>
     </div>` : ""}
-    ${coin.coin_url ? `<a class="primary-btn" data-act="ext" href="${escapeHtml(coin.coin_url)}" target="_blank" rel="noopener">${pos ? "Sell on FOMO" : "Buy on FOMO"}</a>` : ""}`;
+    <div class="h-row"><h2>Desk checks · $${esc(sym.toUpperCase())}</h2><span class="${status === "open" || status === "closed" ? "green" : "muted"} small">${esc(status)}</span></div>
+    <div class="list checks">
+      ${scan ? checkRow("scanner", `Scanner · ${scan.reason || scan.verdict}`, [scan.liquidityUsd != null ? "liq " + compactMoney(scan.liquidityUsd) : "", scan.top10Pct != null ? "top 10 " + pct(scan.top10Pct, 1) : "", scan.h1ChangePct != null ? "1h " + pct(scan.h1ChangePct, 0) : ""].filter(Boolean).join(" · "), `mint ${mint.slice(0, 4)}…${mint.slice(-4)} · ${fmtTime(scan.ts)}`, scan.verdict === "pass" ? ["passed", "g"] : ["killed", "r"]) : ""}
+      ${audit.map((l) => checkRow("auditor", `${l.name}`, l.value || "", `layer ${l.layer}${l.source ? " · " + l.source : ""}${coin.audit.ts ? " · " + fmtTime(coin.audit.ts) : ""}`, LAYER_STATUS(l))).join("")}
+      ${verdict ? checkRow("analyst", `Analyst · score ${verdict.score}`, verdict.reason || "", fmtTime(verdict.ts), verdict.pass ? ["bought", "b"] : ["passed", "x"]) : ""}
+      ${trades.map((t) => checkRow(t.kind === "buy" ? "buy" : "sell", t.kind === "buy" ? `Paper buy · ${money(t.sizeUsd)}` : `Paper sell · ${t.reason || ""}`, t.kind === "sell" ? `${signedMoney(t.pnlUsd)} · x${Number(t.mult || 0).toFixed(2)}` : `at $${Number(t.price).toPrecision(3)}`, fmtTime(t.ts), t.kind === "buy" ? ["bought", "b"] : ["sold", "g"])).join("")}
+      ${!scan && !audit.length && !trades.length ? `<div class="empty-note">No desk checks recorded for this coin.</div>` : ""}
+    </div>
+    <div class="pos-spacer"></div>
+    ${positionBar(coin, buy, sell, nowPrice, devLayer, scan, change)}`;
 
-  requestAnimationFrame(() => {
-    const c = $("#coin-chart");
-    if (c) drawCandles(c, coin.candles || [], coin.exitLines || {});
-  });
+  requestAnimationFrame(() => drawCoinChart(coin, mint, buy, trades, scan, verdict));
 }
 
-function timeoutLeft(ts) {
-  if (!ts) return "—";
-  const d = new Date(ts.endsWith("Z") ? ts : ts + "Z");
-  const ms = d.getTime() - Date.now();
-  if (Number.isNaN(d.getTime())) return "—";
-  if (ms <= 0) return "0m";
-  const m = Math.round(ms / 60000);
-  if (m < 60) return m + "m";
-  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+function checkRow(kind, title, detail, tiny, [tag, cls]) {
+  const ico = { scanner: svgRadar(), auditor: svgShield(), analyst: svgSpark(), buy: "B", sell: "S" }[kind] || "";
+  return `<div class="row check">
+    <span class="cico ${kind}">${ico}</span>
+    <div class="mid"><div class="title">${esc(title)}</div>${detail ? `<div class="sub">${esc(detail)}</div>` : ""}${tiny ? `<div class="tiny">${esc(tiny)}</div>` : ""}</div>
+    <span class="tag ${cls}">${esc(tag)}</span></div>`;
 }
 
-/* ---------- search / toasts ---------- */
+function positionBar(coin, buy, sell, nowPrice, devLayer, scan, change) {
+  if (buy) {
+    const size = Number(buy.sizeUsd || 0);
+    const val = sell ? size + Number(sell.pnlUsd || 0) : buy.price ? size * (nowPrice / buy.price) : size;
+    const p = val - size;
+    return `<div class="posbar"><span class="pico">${svgBolt()}</span>
+      <div class="mid"><div class="title">Position</div><div class="sub">${money(size)} in${devLayer ? " · dev " + esc(devLayer.value) : ""} · ${sell ? "closed" : "open"}</div></div>
+      <div class="right"><div class="amt">${money(val)}</div><div class="${p >= 0 ? "green" : "red"} small">${signedMoney(p)}</div></div></div>`;
+  }
+  const why = scan && scan.verdict !== "pass" ? "Scanner: " + (scan.reason || "killed") : "not bought";
+  return `<div class="posbar"><span class="pico grey">${svgBolt()}</span>
+    <div class="mid"><div class="title">No position</div><div class="sub">${esc(why)}</div></div>
+    <div class="right">${change != null ? `<div class="amt ${change >= 0 ? "green" : "red"}">${change >= 0 ? "+" : "-"}${pct(Math.abs(change), 1)}</div><div class="muted small">since seen</div>` : `<div class="amt">$0.00</div>`}</div></div>`;
+}
 
-function openSearch() {
-  closeSheet();
-  const sheet = document.createElement("div");
-  sheet.className = "sheet";
-  sheet.id = "sheet";
-  sheet.innerHTML = `<div class="sheet-card">
-    <input id="q" type="search" placeholder="Name, symbol or mint" autofocus>
-    <div id="q-results"></div>
-  </div>`;
-  document.body.appendChild(sheet);
-  const input = $("#q");
-  const results = $("#q-results");
-  const draw = () => {
-    const q = (input.value || "").trim().toLowerCase();
-    const items = [];
-    knownMints().forEach((m) => {
-      const c = store.coins[m] || {};
-      const name = c.name || "", sym = c.symbol || "";
-      const blob = (name + " " + sym + " " + m).toLowerCase();
-      if (!q || blob.includes(q)) items.push({ mint: m, name: name || m, symbol: sym });
-    });
-    if (q && q.length >= 8 && !items.some((x) => x.mint === q)) items.push({ mint: q, name: q, symbol: "" });
-    results.innerHTML = items.slice(0, 12).map((it) =>
-      `<button class="row" type="button" data-act="coin" data-mint="${escapeHtml(it.mint)}"><div class="mid"><div class="title">${escapeHtml(it.name)}</div><div class="sub">${escapeHtml(it.symbol || it.mint)}</div></div></button>`
-    ).join("") || `<div class="empty-note">No matches</div>`;
+async function drawCoinChart(coin, mint, buy, trades, scan, verdict) {
+  const c = $("#coin-chart");
+  if (!c) return;
+  const events = [];
+  for (const t of trades || []) {
+    if (t.kind === "buy") events.push({ t: tsMs(t.ts), kind: "buy", price: Number(t.price), label: `Entry${verdict && verdict.score != null ? " · score " + verdict.score : ""}` });
+    else events.push({ t: tsMs(t.ts), kind: "sell", price: Number(t.price), label: `Sold · x${Number(t.mult || 0).toFixed(2)}` });
+  }
+  if (scan && scan.verdict !== "pass") events.push({ t: tsMs(scan.ts), kind: "alert", label: `Scanner · ${scan.reason || "killed"}` });
+  const desk = (coin.candles || []).map((k) => ({ t: tsMs(k.ts), o: k.open, h: k.high, l: k.low, c: k.close }));
+  const draw = (cs, src) => {
+    if (!$("#coin-chart")) return;
+    drawCandles($("#coin-chart"), cs, events);
+    const s = $("#chart-src"); if (s) s.textContent = src;
   };
-  input.addEventListener("input", draw);
-  sheet.addEventListener("click", (e) => {
-    if (e.target === sheet) closeSheet();
-  });
-  draw();
-  input.focus();
+  draw(desk, desk.length ? "desk price samples" : "");
+  const m = meta[mint] || {};
+  const created = m.created || tsMs(coin.createdAt);
+  const pool = coin.pool || m.pairAddress;
+  const cs = await fetchOhlcv(pool, created ? (Date.now() - created) / 60000 : coin.ageMin);
+  if (cs && cs.length && route.mint === mint) draw(cs, "candles: GeckoTerminal");
+}
+
+/* ---------- Stop sheet ---------- */
+
+function openStopSheet() {
+  const st = store.state || {};
+  const open = (st.openPositions || []).map((p) => tick(p.symbol, p.name, p.mint).toUpperCase());
+  const paused = st.entriesPaused;
+  const names = open.length === 0 ? "" : open.length === 1 ? open[0] : open.slice(0, -1).join(", ") + " and " + open[open.length - 1];
+  const msg = open.length
+    ? `${names} ${open.length === 1 ? "is" : "are"} still open — ${open.length === 1 ? "it'll" : "they'll"} be paper-sold at market on fomo prices, and the ${(st.sizing || {}).mode === "compounder" ? "Compounder stops rolling" : "desk takes no new entries"}.`
+    : `Nothing is open right now. The desk will stop taking new paper entries${(st.sizing || {}).mode === "compounder" ? " and the Compounder stops rolling" : ""}.`;
+  const title = paused ? (st.deskStopped ? "The desk is stopped" : "New entries are paused") : "Stop the desk?";
+  const body = paused ? (open.length ? `${names} ${open.length === 1 ? "is" : "are"} still open and guarded by Risk.` : "Nothing is open.") + " Resume to take new paper entries again." : msg;
+  sheetRoot.innerHTML = `<div class="sheet-back" data-act="sheet-close"></div>
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="sheet-group">
+        <div class="sheet-head"><div class="sheet-title">${esc(title)}</div><div class="sheet-msg">${esc(body)}</div></div>
+        ${paused ? `<button class="sheet-btn blue" type="button" data-act="desk" data-cmd="resume">Resume the desk</button>` : ""}
+        ${!st.deskStopped ? `<button class="sheet-btn red" type="button" data-act="desk" data-cmd="stop">Stop &amp; sell all</button>` : ""}
+        ${!paused ? `<button class="sheet-btn blue" type="button" data-act="desk" data-cmd="pause">Pause new entries only</button>` : ""}
+      </div>
+      <button class="sheet-btn cancel" type="button" data-act="sheet-close">Cancel</button>
+      <div class="sheet-foot">PAPER · confirms in your desk's Telegram chat${botName() ? " (@" + esc(botName()) + ")" : ""}</div>
+    </div>`;
+  requestAnimationFrame(() => sheetRoot.classList.add("open"));
 }
 function closeSheet() {
-  const s = $("#sheet");
-  if (s) s.remove();
+  sheetRoot.classList.remove("open");
+  setTimeout(() => { if (!sheetRoot.classList.contains("open")) sheetRoot.innerHTML = ""; }, 250);
 }
+function sendDeskCommand(cmd) {
+  closeSheet();
+  const bot = botName();
+  if (!bot) { toast(`Send /${cmd} to your desk bot in Telegram`); return; }
+  store.pending = { action: cmd, at: Date.now() };
+  softRender();
+  // Deep link: Telegram opens the desk bot; tapping Start sends "/start <cmd>" (owner-only on the desk).
+  location.href = `https://t.me/${encodeURIComponent(bot)}?start=${encodeURIComponent(cmd)}`;
+}
+
+/* ---------- misc ---------- */
+
 function toast(msg) {
   const t = document.createElement("div");
   t.className = "toast";
   t.textContent = msg;
   document.body.appendChild(t);
-  setTimeout(() => t.remove(), 1800);
+  setTimeout(() => t.remove(), 2200);
 }
-
-async function invite() {
+async function share() {
   const url = store.account && store.account.signup_url;
-  if (!url) return;
-  if (navigator.share) {
-    try { await navigator.share({ title: "FOMO", url }); return; } catch {}
-  }
-  try {
-    await navigator.clipboard.writeText(url);
-    toast("Link copied");
-  } catch {
-    toast("Link copied");
-  }
+  const st = store.state || {};
+  const text = `My Grok Bot paper desk: ${money(st.balance)} (${Number(st.multiplierAll || 1).toFixed(2)}x). Trade meme coins on FOMO:`;
+  if (navigator.share && url) { try { await navigator.share({ title: "FOMO", text, url }); return; } catch { return; } }
+  try { await navigator.clipboard.writeText(text + " " + (url || "")); toast("Copied"); } catch { toast("Couldn't copy"); }
 }
 
-/* ---------- main render / events ---------- */
+/* ---------- render / events ---------- */
 
+function softRender() {
+  if (route.screen === "home" || route.screen === "activity") render();
+}
 function render() {
-  setTabs();
   showBanner();
-  if (!token() || !dataPath()) {
-    route.screen = "lock";
-    renderLock();
-    return;
-  }
+  if (!token() || !dataPath()) { route.screen = "lock"; view.classList.add("locked"); renderLock(); return; }
   view.classList.remove("locked");
-  if (store.loading && !store.state) {
-    renderLoading();
-    return;
-  }
+  if (store.loading && !store.state) { renderLoading(); return; }
   const sc = route.screen;
   if (sc === "home") renderHome();
-  else if (sc === "agents") renderAgents();
   else if (sc === "activity") renderActivity();
   else if (sc === "account") renderAccount();
-  else if (sc === "audit") {
-    const au = store.audits[route.mint];
-    if (au === undefined) {
-      renderLoading();
-      ensureAudit(route.mint).then(() => render());
-      return;
-    }
-    renderAudit(au, store.coins[route.mint]);
-  } else if (sc === "coin") {
-    const c = store.coins[route.mint];
+  else if (sc === "agent") renderAgent(route.name);
+  else if (sc === "coin") {
+    const mint = route.mint;
+    const c = store.coins[mint];
     if (c === undefined) {
       renderLoading();
-      ensureCoin(route.mint).then(() => render());
+      Promise.all([ensureCoin(mint), fetchMeta([mint])]).then(() => { if (route.mint === mint) render(); });
       return;
     }
-    renderCoin(c);
-  }
+    renderCoin(c, mint);
+  } else renderHome();
 }
 
 function submitUnlock(e) {
   if (e) e.preventDefault();
   const input = $("#unlock-input");
   const err = $("#unlock-error");
-  const ok = unlockFromPaste(input ? input.value : "");
-  if (!ok) {
-    if (err) {
-      err.hidden = false;
-      err.textContent = "That doesn't look like your private desk link. Paste the whole link, including the #t= part.";
-    }
+  if (!unlockFromPaste(input ? input.value : "")) {
+    if (err) { err.hidden = false; err.textContent = "That doesn't look like your private desk link. Paste the whole link, including the #t= part."; }
     return;
   }
   render();
-  tick();
+  loop();
 }
+view.addEventListener("submit", (e) => { if (e.target.closest("[data-act=unlock-form]")) { e.preventDefault(); submitUnlock(e); } });
 
-view.addEventListener("submit", (e) => {
-  const form = e.target.closest("[data-act=unlock-form]");
-  if (!form) return;
-  e.preventDefault();
-  submitUnlock(e);
-});
-
-view.addEventListener("click", async (e) => {
+async function onClick(e) {
   const ext = e.target.closest("[data-act=ext]");
-  if (ext && ext.href) return; // let the browser follow coin_url / profile_url
+  if (ext && ext.href) return;
   const el = e.target.closest("[data-act]");
   if (!el) return;
   const act = el.dataset.act;
+  if (act === "unlock") return submitUnlock(e);
   if (act === "back") { history.length > 1 ? history.back() : go("#/home", { replace: true }); return; }
-  if (act === "tab") { go("#/" + el.dataset.tab); return; }
+  if (act === "home") { go("#/home"); return; }
+  if (act === "activity") { go("#/activity"); return; }
   if (act === "account") { go("#/account"); return; }
-  if (act === "search") { openSearch(); return; }
-  if (act === "bell") { localStorage.setItem(LS_SEEN, new Date().toISOString()); go("#/activity"); return; }
-  if (act === "range") {
-    store.range = el.dataset.range;
-    await ensureChart(store.range);
-    render();
+  if (act === "share") { share(); return; }
+  if (act === "tg") { const b = botName(); if (b) location.href = "https://t.me/" + encodeURIComponent(b); return; }
+  if (act === "range") { store.range = el.dataset.range; render(); await ensureChart(store.range); if (route.screen === "home") drawHomeChart(); return; }
+  if (act === "coin") { e.stopPropagation(); if (el.dataset.mint) { store.coins[el.dataset.mint] = undefined; go("#/coin/" + el.dataset.mint); } return; }
+  if (act === "agent") { if (route.screen !== "agent") { store.decisions[el.dataset.name] = undefined; go("#/agents/" + el.dataset.name); } return; }
+  if (act === "star") {
+    const list = JSON.parse(localStorage.getItem(LS_STARS) || "[]");
+    const m = el.dataset.mint;
+    const next = list.includes(m) ? list.filter((x) => x !== m) : [...list, m];
+    localStorage.setItem(LS_STARS, JSON.stringify(next));
+    el.classList.toggle("on"); el.textContent = next.includes(m) ? "★" : "☆";
     return;
   }
-  if (act === "coin") { closeSheet(); if (el.dataset.mint) go("#/coin/" + el.dataset.mint); return; }
-  if (act === "audit") { closeSheet(); if (el.dataset.mint) go("#/audit/" + el.dataset.mint); return; }
-  if (act === "settings-group") { go("#/account"); setTimeout(() => { const n = document.getElementById("settings-" + el.dataset.group); if (n) n.scrollIntoView({ behavior: reduced() ? "auto" : "smooth" }); }, 40); return; }
-  if (act === "unlock") { submitUnlock(e); return; }
-  if (act === "invite") { invite(); return; }
-  if (act === "pause-note" || act === "setting-note" || act === "live-note" || act === "test-push" || act === "auditor-toggle") {
-    toast("Change this in Telegram");
-    return;
-  }
-});
-
-tabbar.addEventListener("click", (e) => {
-  const tab = e.target.closest(".tab");
-  if (!tab) return;
-  go("#/" + tab.dataset.tab);
-});
-
-window.addEventListener("popstate", () => {
-  Object.assign(route, parseRoute());
-  render();
-});
+  if (act === "stop-sheet") { openStopSheet(); return; }
+  if (act === "sheet-close") { closeSheet(); return; }
+  if (act === "desk") { sendDeskCommand(el.dataset.cmd); return; }
+}
+document.addEventListener("click", onClick);
+window.addEventListener("popstate", () => { Object.assign(route, { mint: null, name: null }, parseRoute()); render(); });
+window.addEventListener("resize", () => { if (route.screen === "home") drawHomeChart(); });
 
 /* ---------- boot / poll ---------- */
 
-let pollTimer = null;
-let retryTimer = null;
-
-async function tick() {
+let pollTimer = null, retryTimer = null;
+async function loop() {
   await refreshAll();
-  Object.assign(route, parseRoute());
-  render();
+  if (route.screen !== "coin" && route.screen !== "agent") render(); else showBanner();
   if (store.error && store.retryIn > 0) {
     clearInterval(retryTimer);
     retryTimer = setInterval(() => {
       store.retryIn = Math.max(0, store.retryIn - 1);
       showBanner();
-      if (store.retryIn === 0) {
-        clearInterval(retryTimer);
-        tick();
-      }
+      if (store.retryIn === 0) { clearInterval(retryTimer); loop(); }
     }, 1000);
   }
 }
-
 function startPoll() {
   clearInterval(pollTimer);
-  pollTimer = setInterval(() => { if (document.visibilityState !== "hidden") tick(); }, POLL_MS);
+  pollTimer = setInterval(() => { if (document.visibilityState !== "hidden") loop(); }, POLL_MS);
 }
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") tick();
-});
-
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register(new URL("sw.js", baseUrl()), { scope: "./" }).catch(() => {});
-}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") loop(); });
+if ("serviceWorker" in navigator) navigator.serviceWorker.register(new URL("sw.js", baseUrl()), { scope: "./" }).catch(() => {});
 
 consumeAuthFragment();
 Object.assign(route, parseRoute());
 if (!location.hash && token() && dataPath()) history.replaceState(null, "", "#/home");
 
 window.__deskTest = {
-  setDemo(mode) {
-    store.demo = mode || null;
-    if (mode === "error") { store.error = "demo"; store.retryIn = 8; }
-    else if (mode !== "error") { store.error = null; }
-    render();
-  },
-  setBalance(n) {
-    if (!store.state) store.state = {};
-    store.state.balance = n;
-    render();
-  },
-  pausePoll() {
-    clearInterval(pollTimer);
-    clearInterval(retryTimer);
-    pollTimer = null;
-    retryTimer = null;
-  },
-  go,
-  store,
-  parseAuthParams,
-  applyAuthParams,
-  unlockFromPaste,
+  setDemo(m) { store.demo = m || null; if (m === "error") { store.error = "demo"; store.retryIn = 8; } else store.error = null; render(); },
+  pausePoll() { clearInterval(pollTimer); clearInterval(retryTimer); pollTimer = retryTimer = null; },
+  openStopSheet, go, store, meta, parseAuthParams, applyAuthParams, unlockFromPaste,
 };
 
-tick().then(startPoll);
+render();
+loop().then(startPoll);

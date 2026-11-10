@@ -1,5 +1,5 @@
 /* App-shell cache only. Encrypted /d/ snapshots always go to the network. */
-const CACHE = "desk-shell-v3";
+const CACHE = "desk-shell-v5";
 const SHELL = [
   "./",
   "./index.html",
@@ -35,13 +35,15 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(fetch(req));
     return;
   }
+  // Network first so a new app version shows up at once; cache only when offline.
+  if (url.origin !== location.origin) return;
   event.respondWith(
-    caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-      if (res && res.ok && url.origin === location.origin) {
+    fetch(req).then((res) => {
+      if (res && res.ok) {
         const copy = res.clone();
         caches.open(CACHE).then((cache) => cache.put(req, copy));
       }
       return res;
-    }))
+    }).catch(() => caches.match(req, { ignoreSearch: true }))
   );
 });
