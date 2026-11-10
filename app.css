@@ -191,28 +191,44 @@ a { color: var(--blue); text-decoration: none; }
   gap: 8px;
 }
 .odometer {
+  --odo-h: 1em;
   font-family: "SF Pro Display", "SF Pro Text", -apple-system, system-ui, sans-serif;
   font-weight: 700;
   font-size: 72px;
-  line-height: 0.95;
+  line-height: var(--odo-h);
   letter-spacing: -0.04em;
   display: flex;
   align-items: flex-end;
+  height: var(--odo-h);
   overflow: hidden;
 }
-.odo-char { display: inline-block; }
+.odo-char {
+  display: block;
+  height: var(--odo-h);
+  line-height: var(--odo-h);
+  overflow: hidden;
+}
 .odo-reel {
-  display: inline-block;
-  height: 0.95em;
+  display: block;
+  position: relative;
+  height: var(--odo-h);
+  line-height: var(--odo-h);
   overflow: hidden;
-  vertical-align: bottom;
+  contain: paint;
 }
-.odo-reel > span {
+.odo-strip {
   display: flex;
   flex-direction: column;
-  transform: translateY(0);
+  line-height: var(--odo-h);
+  will-change: transform;
 }
-.odo-reel.anim > span { transition: transform 600ms ease-out; }
+.odo-digit {
+  display: block;
+  height: var(--odo-h);
+  line-height: var(--odo-h);
+  overflow: hidden;
+}
+.odo-reel.anim > .odo-strip { transition: transform 600ms ease-out; }
 .paper-pill {
   margin-top: 10px;
   background: var(--orange);

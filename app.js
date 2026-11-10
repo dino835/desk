@@ -349,25 +349,114 @@ function paperBadge(mode) {
   return mode === "PAPER" ? `<span class="paper-pill">PAPER</span>` : "";
 }
 
+const ODO_SPIN_MS = 600;
+let lastOdoText = null;
+
 function odometerHtml(value) {
   const text = money(value);
+  const digits = "0123456789";
   return `<div class="odometer" data-odo="${escapeHtml(text)}">${[...text].map((ch, i) =>
     /[0-9]/.test(ch)
-      ? `<span class="odo-reel" data-i="${i}" data-d="${ch}"><span>${"0123456789".split("").map((n) => n).join("<br>")}</span></span>`
+      ? `<span class="odo-reel" data-i="${i}" data-d="${ch}"><span class="odo-strip">${[...digits].map((n) => `<span class="odo-digit">${n}</span>`).join("")}</span></span>`
       : `<span class="odo-char">${escapeHtml(ch)}</span>`
   ).join("")}</div>`;
 }
 
-function spinOdometer(root, prev, next) {
-  root.querySelectorAll(".odo-reel").forEach((reel) => {
+function reelWindowHeight(reel) {
+  const h = reel.getBoundingClientRect().height;
+  if (h > 0) return h;
+  const fs = parseFloat(getComputedStyle(reel).fontSize);
+  return fs > 0 ? fs : 72;
+}
+
+function settleStrip(strip, digit, height) {
+  const y = -(Number(digit) * height);
+  strip.style.transform = `translate3d(0, ${y}px, 0)`;
+}
+
+function prevDigitForReel(prevText, nextText, index) {
+  if (!prevText || !nextText) return 0;
+  const i = index + (prevText.length - nextText.length);
+  if (i < 0 || i >= prevText.length) return 0;
+  const ch = prevText[i];
+  return /[0-9]/.test(ch) ? Number(ch) : 0;
+}
+
+function clearReelSpin(reel) {
+  const strip = reel.querySelector(".odo-strip");
+  if (reel._odoTimer) { clearTimeout(reel._odoTimer); reel._odoTimer = 0; }
+  if (reel._odoEnd && strip) {
+    strip.removeEventListener("transitionend", reel._odoEnd);
+  }
+  reel._odoEnd = null;
+}
+
+function spinOdometer(root, prevText) {
+  if (!root) return;
+  const nextText = root.dataset.odo || "";
+  const isFirst = prevText == null || prevText === "";
+  const changed = !isFirst && prevText !== nextText;
+  const animate = changed && !reduced();
+  const reels = [...root.querySelectorAll(".odo-reel")];
+
+  const snapReel = (reel, digit) => {
+    clearReelSpin(reel);
+    const strip = reel.querySelector(".odo-strip");
+    if (!strip) return;
+    reel.classList.remove("anim");
+    strip.style.transition = "none";
+    settleStrip(strip, digit, reelWindowHeight(reel));
+  };
+
+  reels.forEach((reel) => {
     const d = Number(reel.dataset.d);
-    const span = reel.querySelector("span");
-    const apply = () => { span.style.transform = `translateY(${-d}em)`; };
-    if (reduced()) { apply(); return; }
-    reel.classList.add("anim");
-    const delay = 30 * (root.querySelectorAll(".odo-reel").length - 1 - Number(reel.dataset.i || 0));
-    setTimeout(apply, Math.max(0, delay));
+    const strip = reel.querySelector(".odo-strip");
+    if (!strip) return;
+    const from = animate ? prevDigitForReel(prevText, nextText, Number(reel.dataset.i || 0)) : d;
+
+    clearReelSpin(reel);
+    reel.classList.remove("anim");
+    strip.style.transition = "none";
+    settleStrip(strip, from, reelWindowHeight(reel));
+    void strip.offsetHeight;
+
+    if (!animate || from === d) {
+      snapReel(reel, d);
+      return;
+    }
+
+    const delay = 30 * (reels.length - 1 - Number(reel.dataset.i || 0));
+    const onEnd = (e) => {
+      if (e && e.target && e.target !== strip) return;
+      if (e && e.propertyName && e.propertyName !== "transform") return;
+      snapReel(reel, d);
+    };
+    reel._odoEnd = onEnd;
+
+    reel._odoTimer = setTimeout(() => {
+      strip.addEventListener("transitionend", onEnd);
+      strip.style.transition = "";
+      reel.classList.add("anim");
+      settleStrip(strip, d, reelWindowHeight(reel));
+      reel._odoTimer = setTimeout(onEnd, ODO_SPIN_MS + 80);
+    }, Math.max(0, delay));
   });
+
+  lastOdoText = nextText;
+
+  const resettleIdle = () => {
+    if (!root.isConnected) return;
+    root.querySelectorAll(".odo-reel").forEach((reel) => {
+      if (reel.classList.contains("anim") || reel._odoTimer) return;
+      const strip = reel.querySelector(".odo-strip");
+      if (!strip) return;
+      settleStrip(strip, Number(reel.dataset.d), reelWindowHeight(reel));
+    });
+  };
+  requestAnimationFrame(resettleIdle);
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(resettleIdle).catch(() => {});
+  }
 }
 
 function activityRow(r) {
@@ -499,6 +588,7 @@ function renderHome() {
   const today = st.todayPct;
   const mult = st.multiplier;
   const bal = st.balance;
+  const prevOdo = lastOdoText ?? $(".odometer")?.dataset.odo ?? null;
   view.innerHTML = `${homeNav()}
     <div class="balance-wrap">
       <div class="balance-row">${odometerHtml(bal)}${paperBadge(mode)}</div>
@@ -518,7 +608,7 @@ function renderHome() {
     ${rows.length ? rows.map(activityRow).join("") : `<div class="empty-note">Nothing yet tonight</div>`}`;
 
   requestAnimationFrame(() => {
-    spinOdometer($(".odometer"));
+    spinOdometer($(".odometer"), prevOdo);
     const c = $("#home-chart");
     if (c) {
       const payload = emptyChart ? { points: ch.points && ch.points.length ? ch.points : [{ ts: st.updatedAt, value: ch.startValue ?? bal }], marks: [], startValue: ch.startValue ?? bal } : ch;
@@ -976,6 +1066,17 @@ window.__deskTest = {
     if (mode === "error") { store.error = "demo"; store.retryIn = 8; }
     else if (mode !== "error") { store.error = null; }
     render();
+  },
+  setBalance(n) {
+    if (!store.state) store.state = {};
+    store.state.balance = n;
+    render();
+  },
+  pausePoll() {
+    clearInterval(pollTimer);
+    clearInterval(retryTimer);
+    pollTimer = null;
+    retryTimer = null;
   },
   go,
   store,

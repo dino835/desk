@@ -1,5 +1,5 @@
 /* App-shell cache only. Encrypted /d/ snapshots always go to the network. */
-const CACHE = "desk-shell-v2";
+const CACHE = "desk-shell-v3";
 const SHELL = [
   "./",
   "./index.html",
