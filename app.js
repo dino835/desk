@@ -1,4 +1,5 @@
 import { drawLineChart, drawCandles, drawScoreRing } from "./chart.js";
+import { applyAuthParams, parseAuthParams } from "./auth.js";
 
 const LS_TOKEN = "desk.appToken";
 const LS_PATH = "desk.dataPath";
@@ -23,24 +24,27 @@ function baseUrl() {
 /* ---------- auth fragment ---------- */
 
 function consumeAuthFragment() {
+  // Fragment only. Never read ?t= / ?d= — query strings hit server logs.
+  const td = parseAuthParams(location.hash || "");
+  if (!td) return;
+  applyAuthParams(td);
   const raw = (location.hash || "").replace(/^#/, "");
-  if (!raw) return;
-  const cut = raw.startsWith("/") ? "" : raw;
-  if (!cut || (!cut.includes("t=") && !cut.includes("d="))) return;
-  const ampRoute = cut.search(/&\/|^\//);
-  const paramStr = ampRoute >= 0 ? cut.slice(0, ampRoute).replace(/&$/, "") : cut;
-  const params = new URLSearchParams(paramStr);
-  const t = params.get("t");
-  const d = params.get("d");
-  if (t) localStorage.setItem(LS_TOKEN, t);
-  if (d) localStorage.setItem(LS_PATH, d);
   let route = "";
+  const ampRoute = raw.search(/&\/|^\//);
   if (ampRoute >= 0) {
-    const rest = cut.slice(ampRoute).replace(/^&/, "");
-    route = rest.startsWith("/") ? "#" + rest : rest;
+    const rest = raw.slice(ampRoute).replace(/^&/, "");
+    route = rest.startsWith("/") ? "#" + rest : (rest ? "#" + rest : "");
   }
-  const next = location.pathname + location.search + route;
-  history.replaceState(null, "", next || location.pathname);
+  history.replaceState(null, "", location.pathname + route);
+}
+
+function unlockFromPaste(raw) {
+  const td = parseAuthParams(raw);
+  if (!td) return false;
+  applyAuthParams(td);
+  history.replaceState(null, "", location.pathname + "#/home");
+  Object.assign(route, parseRoute());
+  return true;
 }
 
 function token() { return localStorage.getItem(LS_TOKEN) || ""; }
@@ -467,7 +471,13 @@ function renderLock() {
   view.classList.add("locked");
   view.innerHTML = `<div class="lock">
     <h1>Grok Bot</h1>
-    <p class="muted">Open your private desk link to sign in. The token stays on this phone and is never sent to a server.</p>
+    <p class="muted">Open the link in Safari (Telegram: tap … → Open in Safari). After Add to Home Screen, paste the link once inside the Home Screen app. The token stays on this phone and is never sent to a server.</p>
+    <form class="lock-form" data-act="unlock-form" method="dialog">
+      <label class="lock-label" for="unlock-input">Private desk link</label>
+      <textarea id="unlock-input" class="lock-input" rows="3" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste the full link, or the #t=…&amp;d=… part"></textarea>
+      <button class="lock-btn" type="submit" data-act="unlock">Unlock</button>
+      <p id="unlock-error" class="lock-error" hidden></p>
+    </form>
   </div>`;
 }
 
@@ -859,6 +869,29 @@ function render() {
   }
 }
 
+function submitUnlock(e) {
+  if (e) e.preventDefault();
+  const input = $("#unlock-input");
+  const err = $("#unlock-error");
+  const ok = unlockFromPaste(input ? input.value : "");
+  if (!ok) {
+    if (err) {
+      err.hidden = false;
+      err.textContent = "That doesn't look like your private desk link. Paste the whole link, including the #t= part.";
+    }
+    return;
+  }
+  render();
+  tick();
+}
+
+view.addEventListener("submit", (e) => {
+  const form = e.target.closest("[data-act=unlock-form]");
+  if (!form) return;
+  e.preventDefault();
+  submitUnlock(e);
+});
+
 view.addEventListener("click", async (e) => {
   const ext = e.target.closest("[data-act=ext]");
   if (ext && ext.href) return; // let the browser follow coin_url / profile_url
@@ -879,6 +912,7 @@ view.addEventListener("click", async (e) => {
   if (act === "coin") { closeSheet(); if (el.dataset.mint) go("#/coin/" + el.dataset.mint); return; }
   if (act === "audit") { closeSheet(); if (el.dataset.mint) go("#/audit/" + el.dataset.mint); return; }
   if (act === "settings-group") { go("#/account"); setTimeout(() => { const n = document.getElementById("settings-" + el.dataset.group); if (n) n.scrollIntoView({ behavior: reduced() ? "auto" : "smooth" }); }, 40); return; }
+  if (act === "unlock") { submitUnlock(e); return; }
   if (act === "invite") { invite(); return; }
   if (act === "pause-note" || act === "setting-note" || act === "live-note" || act === "test-push" || act === "auditor-toggle") {
     toast("Change this in Telegram");
@@ -945,6 +979,9 @@ window.__deskTest = {
   },
   go,
   store,
+  parseAuthParams,
+  applyAuthParams,
+  unlockFromPaste,
 };
 
 tick().then(startPoll);

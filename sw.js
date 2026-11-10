@@ -1,10 +1,11 @@
 /* App-shell cache only. Encrypted /d/ snapshots always go to the network. */
-const CACHE = "desk-shell-v1";
+const CACHE = "desk-shell-v2";
 const SHELL = [
   "./",
   "./index.html",
   "./app.css",
   "./app.js",
+  "./auth.js",
   "./chart.js",
   "./manifest.json",
   "./icons/apple-touch-icon.png",
