@@ -363,7 +363,7 @@ function agentCard(name) {
   return `<article class="acard" data-act="agent" data-name="risk">
     <header><span class="aico red">${svgTri()}</span><div><div class="aname">Risk</div><div class="asub"><i class="dot ${dot}"></i>${open.length} open · guarding</div></div></header>
     <div class="pills"><span class="pill r">stop -${esc(String(a.stopPct ?? "—"))}%</span><span class="pill g">trail ${esc(String(a.trailPct ?? "—"))}%</span></div>
-    <div class="alist">${open.length ? open.map((p) => `<button class="arow" type="button" data-act="coin" data-mint="${esc(p.mint)}">${coinAvatar(p.mint, p.symbol, 28)}<span class="arow-t">${esc(tick(p.symbol, p.name, p.mint))}</span><span class="arow-m">${money(p.sizeUsd)} in</span></button>`).join("")
+    <div class="alist">${open.length ? open.map((p) => `<button class="arow" type="button" data-act="coin" data-mint="${esc(p.mint)}">${coinAvatar(p.mint, p.symbol, 28)}<span class="arow-t">${esc(tick(p.symbol, p.name, p.mint))}</span><span class="arow-m">${money(p.sizeUsd)} in${p.pnlUsd != null ? " · " + signedMoney(p.pnlUsd) : ""}</span></button>`).join("")
       : `<div class="aempty">${a.lastExit ? "Last exit: " + esc(a.lastExit.reason || "") + " · " + signedMoney(a.lastExit.pnlUsd) : `Nothing open. Sells on the stop, the trail or the ${esc(String(((store.settings && store.settings.settings) || {}).timeout_h ?? 3))}h timeout.`}</div>`}</div>
   </article>`;
 }
@@ -381,10 +381,10 @@ function parseValue(v) {
 
 function tradeRow(r) {
   const kind = (r.kind || "").toLowerCase();
-  const badge = kind === "bought" ? "buy" : kind === "stopped" ? "stop" : "sell";
+  const badge = kind === "bought" ? "buy" : kind === "stopped" ? "stop" : kind === "sold" ? "sell" : "";
   const { amount, sub } = parseValue(r.value);
   const title = (r.title || kind).replace(r.name || "\u0000", tick(r.symbol, r.name, r.mint));
-  const amtCls = kind === "bought" ? "" : amount.startsWith("-") ? "red" : "green";
+  const amtCls = kind === "bought" || kind === "rejected" || kind === "paused" ? "" : amount.startsWith("-") ? "red" : "green";
   return `<button class="row" type="button" data-act="coin" data-mint="${esc(r.mint || "")}">
     ${coinAvatar(r.mint, r.symbol, 42, badge)}
     <div class="mid"><div class="title">${esc(title)}</div><div class="sub">${esc([r.subtitle, fmtTime(r.ts)].filter(Boolean).join(" · "))}</div></div>
@@ -635,7 +635,7 @@ function renderCoin(coin, mint) {
       ${scan ? checkRow("scanner", `Scanner · ${scan.reason || scan.verdict}`, [scan.liquidityUsd != null ? "liq " + compactMoney(scan.liquidityUsd) : "", scan.top10Pct != null ? "top 10 " + pct(scan.top10Pct, 1) : "", scan.h1ChangePct != null ? "1h " + pct(scan.h1ChangePct, 0) : ""].filter(Boolean).join(" · "), `mint ${mint.slice(0, 4)}…${mint.slice(-4)} · ${fmtTime(scan.ts)}`, scan.verdict === "pass" ? ["passed", "g"] : ["killed", "r"]) : ""}
       ${audit.map((l) => checkRow("auditor", `${l.name}`, l.value || "", `layer ${l.layer}${l.source ? " · " + l.source : ""}${coin.audit.ts ? " · " + fmtTime(coin.audit.ts) : ""}`, LAYER_STATUS(l))).join("")}
       ${verdict ? checkRow("analyst", `Analyst · score ${verdict.score}`, verdict.reason || "", fmtTime(verdict.ts), verdict.pass ? ["bought", "b"] : ["passed", "x"]) : ""}
-      ${trades.map((t) => checkRow(t.kind === "buy" ? "buy" : "sell", t.kind === "buy" ? `Paper buy · ${money(t.sizeUsd)}` : `Paper sell · ${t.reason || ""}`, t.kind === "sell" ? `${signedMoney(t.pnlUsd)} · x${Number(t.mult || 0).toFixed(2)}` : `at $${Number(t.price).toPrecision(3)}`, fmtTime(t.ts), t.kind === "buy" ? ["bought", "b"] : ["sold", "g"])).join("")}
+      ${trades.map((t) => checkRow(t.kind === "buy" ? "buy" : "sell", t.kind === "buy" ? `Paper buy · ${money(t.sizeUsd)}${t.reason ? " · " + t.reason : ""}` : `Paper sell · ${t.reason || ""}`, t.kind === "sell" ? `${signedMoney(t.pnlUsd)} · x${Number(t.mult || 0).toFixed(2)}` : `at $${Number(t.price).toPrecision(3)}`, fmtTime(t.ts), t.kind === "buy" ? ["bought", "b"] : ["sold", "g"])).join("")}
       ${!scan && !audit.length && !trades.length ? `<div class="empty-note">No desk checks recorded for this coin.</div>` : ""}
     </div>
     <div class="pos-spacer"></div>
@@ -658,7 +658,7 @@ function positionBar(coin, buy, sell, nowPrice, devLayer, scan, change) {
     const val = sell ? size + Number(sell.pnlUsd || 0) : buy.price ? size * (nowPrice / buy.price) : size;
     const p = val - size;
     return `<div class="posbar"><span class="pico">${svgBolt()}</span>
-      <div class="mid"><div class="title">Position</div><div class="sub">${money(size)} in${devLayer ? " · dev " + esc(devLayer.value) : ""} · ${sell ? "closed" : "open"}</div></div>
+      <div class="mid"><div class="title">Position</div><div class="sub">${money(size)} in${buy.reason ? " · " + esc(buy.reason) : ""}${devLayer ? " · dev " + esc(devLayer.value) : ""} · ${sell ? "closed" : "open"}</div></div>
       <div class="right"><div class="amt">${money(val)}</div><div class="${p >= 0 ? "green" : "red"} small">${signedMoney(p)}</div></div></div>`;
   }
   const why = scan && scan.verdict !== "pass" ? "Scanner: " + (scan.reason || "killed") : "not bought";
